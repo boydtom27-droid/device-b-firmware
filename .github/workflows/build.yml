@@ -1,6 +1,7 @@
 name: Build ESP32 Firmware
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "main" ]
 
@@ -10,24 +11,36 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Setup Arduino CLI
-        uses: arduino/setup-arduino-cli@v1
+      - name: Install Arduino CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+          sudo mv bin/arduino-cli /usr/local/bin/arduino-cli
+          arduino-cli version
 
       - name: Install ESP32 core
         run: |
+          arduino-cli config init --overwrite
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
+      - name: Install libraries
+        run: |
+          arduino-cli lib update-index
+          arduino-cli lib install "ArduinoJson"
+          arduino-cli lib install "GxEPD2"
+
       - name: Compile firmware
         run: |
+          mkdir -p build
           arduino-cli compile \
             --fqbn esp32:esp32:esp32s3 \
-            device_b_milestone3_graph_ota_firmware_v2.ino
+            --output-dir build \
+            .
 
       - name: Upload .bin artifact
         uses: actions/upload-artifact@v4
         with:
           name: firmware-bin
-          path: build/*/*.bin
+          path: build/*.bin
