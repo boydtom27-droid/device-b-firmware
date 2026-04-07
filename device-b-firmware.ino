@@ -36,7 +36,7 @@ bool mdnsActive = false;
 
 const char* relayBaseUrl = "https://device-b-relay.onrender.com";
 const char* relayToken = "abc123xyz789";
-const char* firmwareVersion = "4.0.0";
+const char* firmwareVersion = "3.2.0";
 
 struct SavedNetwork {
   const char* ssid;
@@ -44,15 +44,13 @@ struct SavedNetwork {
 };
 SavedNetwork preferredNetworks[] = {
   {"ASUS", "le0pardess"},
-  {"Tomspot", "Tom00001"},
-  {"guest-dog", "givemeinternet"}
+  {"guest-dog", "givemeinternet"},
+  {"Tomspot", "Tom00001"}
 };
 const int preferredNetworkCount = sizeof(preferredNetworks) / sizeof(preferredNetworks[0]);
 
 unsigned long lastMetaPoll = 0;
 const unsigned long metaPollInterval = 30000UL;
-unsigned long lastOTACheck = 0;
-const unsigned long otaCheckInterval = 600000UL;
 unsigned long lastTimeSync = 0;
 const unsigned long timeSyncInterval = 21600000UL;
 bool refreshInProgress = false;
@@ -60,6 +58,7 @@ bool renderJobQueued = false;
 unsigned long targetJobId = 0;
 unsigned long lastAckedJobId = 0;
 bool timeSynced = false;
+bool otaAttemptedThisBoot = false;
 
 enum DeviceState { STATE_IDLE, STATE_POLL_META, STATE_FETCH_JOB, STATE_RENDER_JOB, STATE_ACK_JOB, STATE_COOLDOWN };
 DeviceState deviceState = STATE_IDLE;
@@ -357,17 +356,27 @@ bool performOTA(String url) {
 }
 
 bool checkForOTA(unsigned long forceFlag) {
+  if (forceFlag == 0) return false;       // manual-only OTA
+  if (otaAttemptedThisBoot) return false; // one OTA attempt per boot
   if (usingFallbackAP) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
+
   String payload;
   String url = String(relayBaseUrl) + "/api/firmware_meta?token=" + relayToken;
   if (!httpGET(url, payload)) return false;
+
   DynamicJsonDocument doc(1024);
   if (deserializeJson(doc, payload)) return false;
+
   String newVersion = doc["version"] | "";
   String binUrl = doc["url"] | "";
-  if (newVersion == String(firmwareVersion) && forceFlag == 0) return false;
-  Serial.print("OTA START: "); Serial.println(newVersion);
+  if (binUrl.length() == 0) return false;
+
+  otaAttemptedThisBoot = true;
+
+  Serial.print("MANUAL OTA START: ");
+  Serial.println(newVersion);
+
   return performOTA(binUrl);
 }
 
@@ -550,6 +559,8 @@ void runStateMachine() {
 }
 
 void setup() {
+  otaAttemptedThisBoot = false;
+
   Serial.begin(115200);
   delay(400);
   Serial.println();
@@ -570,13 +581,13 @@ void setup() {
       updateDisplayFromRenderOps(); ackCurrentJob(targetJobId); lastAckedJobId = targetJobId;
     } else updateBootStatusScreen("Relay online", "No job");
   } else updateBootStatusScreen("Relay fetch fail", activeAddress);
-  lastMetaPoll = millis(); lastOTACheck = millis(); deviceState = STATE_IDLE;
+  lastMetaPoll = millis();
+  deviceState = STATE_IDLE;
 }
 
 void loop() {
   server.handleClient();
   if (!usingFallbackAP && (millis() - lastTimeSync > timeSyncInterval)) syncTimeNow();
-  if (!usingFallbackAP && (millis() - lastOTACheck > otaCheckInterval)) { checkForOTA(0); lastOTACheck = millis(); }
   handleButtonRefresh();
   runStateMachine();
   if (millis() - lastProgressPartial > progressPartialInterval) { updateProgressPartials(); lastProgressPartial = millis(); }
