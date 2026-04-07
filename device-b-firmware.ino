@@ -45,6 +45,7 @@ struct SavedNetwork {
 SavedNetwork preferredNetworks[] = {
   {"ASUS", "le0pardess"},
   {"Tomspot", "Tom00001"}
+  {"guest_dog", "givemeinternet"}
 };
 const int preferredNetworkCount = sizeof(preferredNetworks) / sizeof(preferredNetworks[0]);
 
