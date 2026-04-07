@@ -36,7 +36,7 @@ bool mdnsActive = false;
 
 const char* relayBaseUrl = "https://device-b-relay.onrender.com";
 const char* relayToken = "abc123xyz789";
-const char* firmwareVersion = "3.2.0";
+const char* firmwareVersion = "5.2.0";
 
 struct SavedNetwork {
   const char* ssid;
