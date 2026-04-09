@@ -12,7 +12,7 @@
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
-#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA"
+#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_TIMING_GRAPH_V4"
 
 #define CS 10
 #define DC 9
@@ -36,7 +36,7 @@ bool mdnsActive = false;
 
 const char* relayBaseUrl = "https://device-b-relay.onrender.com";
 const char* relayToken = "abc123xyz789";
-const char* firmwareVersion = "5.2.0";
+const char* firmwareVersion = "3.2.1";
 
 struct SavedNetwork {
   const char* ssid;
