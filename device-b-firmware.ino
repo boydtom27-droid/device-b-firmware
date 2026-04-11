@@ -12,7 +12,7 @@
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
-#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V5_TIMEFIX_NOPARTIAL"
+#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA"
 
 #define CS 10
 #define DC 9
@@ -36,7 +36,7 @@ bool mdnsActive = false;
 
 const char* relayBaseUrl = "https://device-b-relay.onrender.com";
 const char* relayToken = "abc123xyz789";
-const char* firmwareVersion = "3.2.1";
+const char* firmwareVersion = "3.2.0";
 
 struct SavedNetwork {
   const char* ssid;
@@ -44,12 +44,15 @@ struct SavedNetwork {
 };
 SavedNetwork preferredNetworks[] = {
   {"ASUS", "le0pardess"},
+  {"guest-dog", "givemeinternet"},
   {"Tomspot", "Tom00001"}
 };
 const int preferredNetworkCount = sizeof(preferredNetworks) / sizeof(preferredNetworks[0]);
 
 unsigned long lastMetaPoll = 0;
 const unsigned long metaPollInterval = 30000UL;
+unsigned long lastOTACheck = 0;
+const unsigned long otaCheckInterval = 600000UL;
 unsigned long lastTimeSync = 0;
 const unsigned long timeSyncInterval = 21600000UL;
 bool refreshInProgress = false;
@@ -57,7 +60,6 @@ bool renderJobQueued = false;
 unsigned long targetJobId = 0;
 unsigned long lastAckedJobId = 0;
 bool timeSynced = false;
-bool otaAttemptedThisBoot = false;
 
 enum DeviceState { STATE_IDLE, STATE_POLL_META, STATE_FETCH_JOB, STATE_RENDER_JOB, STATE_ACK_JOB, STATE_COOLDOWN };
 DeviceState deviceState = STATE_IDLE;
@@ -95,8 +97,8 @@ struct ProgressRegion {
 const int MAX_PROGRESS_REGIONS = 16;
 ProgressRegion progressRegions[MAX_PROGRESS_REGIONS];
 int progressRegionCount = 0;
-unsigned long lastTimedMainRefresh = 0;
-const unsigned long timedMainRefreshInterval = 300000UL; // 5 min
+unsigned long lastProgressPartial = 0;
+const unsigned long progressPartialInterval = 30000UL;
 
 
 struct RelayMeta {
@@ -128,7 +130,7 @@ bool performOTA(String url);
 void renderCurrentOpsPaged();
 uint16_t mapColor(uint8_t colorCode);
 float progressFraction(const ProgressRegion &r);
-void drawDynamicProgressFillsOnce();
+void updateProgressPartials();
 
 bool waitForDisplay() {
   unsigned long start = millis();
@@ -210,11 +212,7 @@ void syncTimeNow() {
     timeSynced = false;
     return;
   }
-
-  setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0/2", 1);
-  tzset();
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-
   struct tm timeinfo;
   for (int i = 0; i < 12; i++) {
     if (getLocalTime(&timeinfo)) {
@@ -359,27 +357,17 @@ bool performOTA(String url) {
 }
 
 bool checkForOTA(unsigned long forceFlag) {
-  if (forceFlag == 0) return false;       // manual-only OTA
-  if (otaAttemptedThisBoot) return false; // one OTA attempt per boot
   if (usingFallbackAP) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
-
   String payload;
   String url = String(relayBaseUrl) + "/api/firmware_meta?token=" + relayToken;
   if (!httpGET(url, payload)) return false;
-
   DynamicJsonDocument doc(1024);
   if (deserializeJson(doc, payload)) return false;
-
   String newVersion = doc["version"] | "";
   String binUrl = doc["url"] | "";
-  if (binUrl.length() == 0) return false;
-
-  otaAttemptedThisBoot = true;
-
-  Serial.print("MANUAL OTA START: ");
-  Serial.println(newVersion);
-
+  if (newVersion == String(firmwareVersion) && forceFlag == 0) return false;
+  Serial.print("OTA START: "); Serial.println(newVersion);
   return performOTA(binUrl);
 }
 
@@ -426,10 +414,7 @@ void executeRenderOpsOnce() {
 void renderCurrentOpsPaged() {
   display.setFullWindow();
   display.firstPage();
-  do {
-    executeRenderOpsOnce();
-    drawDynamicProgressFillsOnce();
-  } while (display.nextPage());
+  do { executeRenderOpsOnce(); } while (display.nextPage());
 }
 
 float progressFraction(const ProgressRegion &r) {
@@ -455,10 +440,17 @@ float progressFraction(const ProgressRegion &r) {
   return frac;
 }
 
-void drawDynamicProgressFillsOnce() {
+void updateProgressPartials() {
+  if (refreshInProgress) return;
   if (currentPageType != "main") return;
   if (progressRegionCount <= 0) return;
   if (!timeSynced) return;
+
+  refreshInProgress = true;
+  displayWake();
+  display.init();
+  delay(40);
+  waitForDisplay();
 
   for (int i = 0; i < progressRegionCount; i++) {
     const ProgressRegion &pr = progressRegions[i];
@@ -467,23 +459,22 @@ void drawDynamicProgressFillsOnce() {
     int fill = (int)(frac * pr.w);
     if (fill < 0) fill = 0;
     if (fill > pr.w) fill = pr.w;
-    if (fill > 0) {
-      display.fillRect(pr.x, pr.y, fill, pr.h, GxEPD_BLACK);
-    }
+    display.setPartialWindow(pr.x, pr.y, pr.w, pr.h);
+    display.firstPage();
+    do {
+      if (fill > 0) display.fillRect(pr.x, pr.y, fill, pr.h, GxEPD_BLACK);
+    } while (display.nextPage());
+    delay(1);
   }
+
+  displaySleep();
+  refreshInProgress = false;
 }
 
 void updateDisplayFromRenderOps() {
   if (refreshInProgress) return;
   refreshInProgress = true;
-  displayWake();
-  display.init();
-  delay(100);
-  waitForDisplay();
-  renderCurrentOpsPaged();
-  displaySleep();
-  lastTimedMainRefresh = millis();
-  refreshInProgress = false;
+  displayWake(); display.init(); delay(100); waitForDisplay(); renderCurrentOpsPaged(); displaySleep(); lastProgressPartial = millis(); refreshInProgress = false;
 }
 
 void updateBootStatusScreen(const String &line1, const String &line2) {
@@ -559,12 +550,10 @@ void runStateMachine() {
 }
 
 void setup() {
-  otaAttemptedThisBoot = false;
-
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("BOOT: DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V5_TIMEFIX_NOPARTIAL");
+  Serial.println("BOOT: DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA");
   pinMode(PWR_PIN, OUTPUT); digitalWrite(PWR_PIN, LOW); pinMode(REFRESH_BUTTON, INPUT_PULLUP);
   connectPreferredOrFallback();
   updateBootStatusScreen("Booting...", activeAddress);
@@ -581,28 +570,15 @@ void setup() {
       updateDisplayFromRenderOps(); ackCurrentJob(targetJobId); lastAckedJobId = targetJobId;
     } else updateBootStatusScreen("Relay online", "No job");
   } else updateBootStatusScreen("Relay fetch fail", activeAddress);
-  lastMetaPoll = millis();
-  lastTimedMainRefresh = millis();
-  deviceState = STATE_IDLE;
+  lastMetaPoll = millis(); lastOTACheck = millis(); deviceState = STATE_IDLE;
 }
 
 void loop() {
   server.handleClient();
-
-  if (!usingFallbackAP && (millis() - lastTimeSync > timeSyncInterval)) {
-    syncTimeNow();
-  }
-
+  if (!usingFallbackAP && (millis() - lastTimeSync > timeSyncInterval)) syncTimeNow();
+  if (!usingFallbackAP && (millis() - lastOTACheck > otaCheckInterval)) { checkForOTA(0); lastOTACheck = millis(); }
   handleButtonRefresh();
   runStateMachine();
-
-  if (currentPageType == "main" &&
-      !refreshInProgress &&
-      !renderJobQueued &&
-      (millis() - lastTimedMainRefresh > timedMainRefreshInterval)) {
-    Serial.println("TIMED MAIN FULL REFRESH");
-    updateDisplayFromRenderOps();
-  }
-
+  if (millis() - lastProgressPartial > progressPartialInterval) { updateProgressPartials(); lastProgressPartial = millis(); }
   delay(1);
 }
