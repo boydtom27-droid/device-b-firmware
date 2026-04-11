@@ -12,7 +12,7 @@
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
-#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V6_V5_TIMEFIX_NOPARTIAL"
+#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA"
 
 #define CS 10
 #define DC 9
@@ -36,7 +36,7 @@ bool mdnsActive = false;
 
 const char* relayBaseUrl = "https://device-b-relay.onrender.com";
 const char* relayToken = "abc123xyz789";
-const char* firmwareVersion = "3.2.1";
+const char* firmwareVersion = "3.2.0";
 
 struct SavedNetwork {
   const char* ssid;
@@ -44,6 +44,7 @@ struct SavedNetwork {
 };
 SavedNetwork preferredNetworks[] = {
   {"ASUS", "le0pardess"},
+  {"guest-dog", "givemeinternet"},
   {"Tomspot", "Tom00001"}
 };
 const int preferredNetworkCount = sizeof(preferredNetworks) / sizeof(preferredNetworks[0]);
@@ -95,8 +96,8 @@ struct ProgressRegion {
 const int MAX_PROGRESS_REGIONS = 16;
 ProgressRegion progressRegions[MAX_PROGRESS_REGIONS];
 int progressRegionCount = 0;
-unsigned long lastTimedMainRefresh = 0;
-const unsigned long timedMainRefreshInterval = 300000UL; // 5 min
+unsigned long lastProgressPartial = 0;
+const unsigned long progressPartialInterval = 30000UL;
 
 
 struct RelayMeta {
@@ -128,7 +129,7 @@ bool performOTA(String url);
 void renderCurrentOpsPaged();
 uint16_t mapColor(uint8_t colorCode);
 float progressFraction(const ProgressRegion &r);
-void drawDynamicProgressFillsOnce();
+void updateProgressPartials();
 
 bool waitForDisplay() {
   unsigned long start = millis();
@@ -210,11 +211,7 @@ void syncTimeNow() {
     timeSynced = false;
     return;
   }
-
-  setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0/2", 1);
-  tzset();
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-
   struct tm timeinfo;
   for (int i = 0; i < 12; i++) {
     if (getLocalTime(&timeinfo)) {
@@ -405,13 +402,7 @@ void executeRenderOpsOnce() {
       case OP_TEXT:
         applyFont(ro.font); display.setTextColor(mapColor(ro.color)); display.setCursor(ro.x, ro.y); display.print(ro.text); display.setTextColor(GxEPD_BLACK); break;
       case OP_BAR_OUTLINE: display.drawRect(ro.x, ro.y, ro.w, ro.h, mapColor(ro.color)); break;
-      case OP_BAR_FILL:
-        // On the main page, task/schedule fills are drawn locally from progress metadata
-        // during the full render pass to avoid mixed relay/device bar states.
-        if (!(currentPageType == "main" && progressRegionCount > 0)) {
-          if (ro.w > 0 && ro.h > 0) display.fillRect(ro.x, ro.y, ro.w, ro.h, mapColor(ro.color));
-        }
-        break;
+      case OP_BAR_FILL: if (ro.w > 0 && ro.h > 0) display.fillRect(ro.x, ro.y, ro.w, ro.h, mapColor(ro.color)); break;
       case OP_URGENT_BORDER:
         display.drawRect(ro.x, ro.y, ro.w, ro.h, GxEPD_RED); display.drawRect(ro.x + 1, ro.y + 1, ro.w - 2, ro.h - 2, GxEPD_RED); break;
       case OP_REISSUE_BARS: {
@@ -432,10 +423,7 @@ void executeRenderOpsOnce() {
 void renderCurrentOpsPaged() {
   display.setFullWindow();
   display.firstPage();
-  do {
-    executeRenderOpsOnce();
-    drawDynamicProgressFillsOnce();
-  } while (display.nextPage());
+  do { executeRenderOpsOnce(); } while (display.nextPage());
 }
 
 float progressFraction(const ProgressRegion &r) {
@@ -461,10 +449,17 @@ float progressFraction(const ProgressRegion &r) {
   return frac;
 }
 
-void drawDynamicProgressFillsOnce() {
+void updateProgressPartials() {
+  if (refreshInProgress) return;
   if (currentPageType != "main") return;
   if (progressRegionCount <= 0) return;
   if (!timeSynced) return;
+
+  refreshInProgress = true;
+  displayWake();
+  display.init();
+  delay(40);
+  waitForDisplay();
 
   for (int i = 0; i < progressRegionCount; i++) {
     const ProgressRegion &pr = progressRegions[i];
@@ -473,27 +468,22 @@ void drawDynamicProgressFillsOnce() {
     int fill = (int)(frac * pr.w);
     if (fill < 0) fill = 0;
     if (fill > pr.w) fill = pr.w;
-    // Repaint the full interior deterministically each full refresh: clear to white, then fill black.
-    if (pr.w > 0 && pr.h > 0) {
-      display.fillRect(pr.x, pr.y, pr.w, pr.h, GxEPD_WHITE);
-    }
-    if (fill > 0) {
-      display.fillRect(pr.x, pr.y, fill, pr.h, GxEPD_BLACK);
-    }
+    display.setPartialWindow(pr.x, pr.y, pr.w, pr.h);
+    display.firstPage();
+    do {
+      if (fill > 0) display.fillRect(pr.x, pr.y, fill, pr.h, GxEPD_BLACK);
+    } while (display.nextPage());
+    delay(1);
   }
+
+  displaySleep();
+  refreshInProgress = false;
 }
 
 void updateDisplayFromRenderOps() {
   if (refreshInProgress) return;
   refreshInProgress = true;
-  displayWake();
-  display.init();
-  delay(100);
-  waitForDisplay();
-  renderCurrentOpsPaged();
-  displaySleep();
-  lastTimedMainRefresh = millis();
-  refreshInProgress = false;
+  displayWake(); display.init(); delay(100); waitForDisplay(); renderCurrentOpsPaged(); displaySleep(); lastProgressPartial = millis(); refreshInProgress = false;
 }
 
 void updateBootStatusScreen(const String &line1, const String &line2) {
@@ -574,7 +564,7 @@ void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("BOOT: DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V6_V5_TIMEFIX_NOPARTIAL");
+  Serial.println("BOOT: DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA");
   pinMode(PWR_PIN, OUTPUT); digitalWrite(PWR_PIN, LOW); pinMode(REFRESH_BUTTON, INPUT_PULLUP);
   connectPreferredOrFallback();
   updateBootStatusScreen("Booting...", activeAddress);
@@ -592,27 +582,14 @@ void setup() {
     } else updateBootStatusScreen("Relay online", "No job");
   } else updateBootStatusScreen("Relay fetch fail", activeAddress);
   lastMetaPoll = millis();
-  lastTimedMainRefresh = millis();
   deviceState = STATE_IDLE;
 }
 
 void loop() {
   server.handleClient();
-
-  if (!usingFallbackAP && (millis() - lastTimeSync > timeSyncInterval)) {
-    syncTimeNow();
-  }
-
+  if (!usingFallbackAP && (millis() - lastTimeSync > timeSyncInterval)) syncTimeNow();
   handleButtonRefresh();
   runStateMachine();
-
-  if (currentPageType == "main" &&
-      !refreshInProgress &&
-      !renderJobQueued &&
-      (millis() - lastTimedMainRefresh > timedMainRefreshInterval)) {
-    Serial.println("TIMED MAIN FULL REFRESH");
-    updateDisplayFromRenderOps();
-  }
-
+  if (millis() - lastProgressPartial > progressPartialInterval) { updateProgressPartials(); lastProgressPartial = millis(); }
   delay(1);
 }
