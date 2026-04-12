@@ -12,7 +12,7 @@
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
-#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA"
+#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V7_RELAY_TIMING"
 
 #define CS 10
 #define DC 9
@@ -36,7 +36,7 @@ bool mdnsActive = false;
 
 const char* relayBaseUrl = "https://device-b-relay.onrender.com";
 const char* relayToken = "abc123xyz789";
-const char* firmwareVersion = "3.2.0";
+const char* firmwareVersion = "3.3.0";
 
 struct SavedNetwork {
   const char* ssid;
@@ -96,8 +96,8 @@ struct ProgressRegion {
 const int MAX_PROGRESS_REGIONS = 16;
 ProgressRegion progressRegions[MAX_PROGRESS_REGIONS];
 int progressRegionCount = 0;
-unsigned long lastProgressPartial = 0;
-const unsigned long progressPartialInterval = 30000UL;
+unsigned long lastTimedFullRefresh = 0;
+const unsigned long timedFullRefreshInterval = 300000UL;
 
 
 struct RelayMeta {
@@ -130,6 +130,7 @@ void renderCurrentOpsPaged();
 uint16_t mapColor(uint8_t colorCode);
 float progressFraction(const ProgressRegion &r);
 void updateProgressPartials();
+bool requestTimedMainRefresh();
 
 bool waitForDisplay() {
   unsigned long start = millis();
@@ -212,6 +213,8 @@ void syncTimeNow() {
     return;
   }
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0/2", 1);
+  tzset();
   struct tm timeinfo;
   for (int i = 0; i < 12; i++) {
     if (getLocalTime(&timeinfo)) {
@@ -223,6 +226,7 @@ void syncTimeNow() {
   }
   timeSynced = false;
 }
+
 
 bool httpGET(String url, String &out) {
   if (usingFallbackAP) return false;
@@ -483,7 +487,7 @@ void updateProgressPartials() {
 void updateDisplayFromRenderOps() {
   if (refreshInProgress) return;
   refreshInProgress = true;
-  displayWake(); display.init(); delay(100); waitForDisplay(); renderCurrentOpsPaged(); displaySleep(); lastProgressPartial = millis(); refreshInProgress = false;
+  displayWake(); display.init(); delay(100); waitForDisplay(); renderCurrentOpsPaged(); displaySleep(); lastTimedFullRefresh = millis(); refreshInProgress = false;
 }
 
 void updateBootStatusScreen(const String &line1, const String &line2) {
@@ -517,6 +521,21 @@ String localWebpage() {
 
 void handleRoot() { server.send(200, "text/html", localWebpage()); }
 void handleRefresh() { if (!refreshInProgress) renderJobQueued = true; server.sendHeader("Location", "/"); server.send(303); }
+
+bool requestTimedMainRefresh() {
+  if (usingFallbackAP) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (currentPageType != "main") return false;
+  String rebuildUrl = String(relayBaseUrl) + "/api/rebuild_now?token=" + relayToken;
+  if (!httpPOSTempty(rebuildUrl)) return false;
+  if (!fetchRelayMetaNow(latestMeta)) return false;
+  if (latestMeta.jobId == 0) return false;
+  targetJobId = latestMeta.jobId;
+  renderJobQueued = true;
+  lastMetaPoll = millis();
+  lastTimedFullRefresh = millis();
+  return true;
+}
 
 void handleButtonRefresh() {
   static unsigned long lastButtonAction = 0;
@@ -582,6 +601,7 @@ void setup() {
     } else updateBootStatusScreen("Relay online", "No job");
   } else updateBootStatusScreen("Relay fetch fail", activeAddress);
   lastMetaPoll = millis();
+  lastTimedFullRefresh = millis();
   deviceState = STATE_IDLE;
 }
 
@@ -590,6 +610,8 @@ void loop() {
   if (!usingFallbackAP && (millis() - lastTimeSync > timeSyncInterval)) syncTimeNow();
   handleButtonRefresh();
   runStateMachine();
-  if (millis() - lastProgressPartial > progressPartialInterval) { updateProgressPartials(); lastProgressPartial = millis(); }
+  if (!refreshInProgress && (millis() - lastTimedFullRefresh > timedFullRefreshInterval)) {
+    requestTimedMainRefresh();
+  }
   delay(1);
 }
