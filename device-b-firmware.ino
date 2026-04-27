@@ -12,7 +12,7 @@
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
-#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V7_RELAY_TIMING"
+#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V8_CALENDAR_ORDER_REISSUE"
 
 #define CS 10
 #define DC 9
@@ -63,7 +63,7 @@ bool otaAttemptedThisBoot = false;
 enum DeviceState { STATE_IDLE, STATE_POLL_META, STATE_FETCH_JOB, STATE_RENDER_JOB, STATE_ACK_JOB, STATE_COOLDOWN };
 DeviceState deviceState = STATE_IDLE;
 
-enum OpType : uint8_t { OP_CLEAR = 0, OP_RECT = 1, OP_FILL_RECT = 2, OP_LINE = 3, OP_TEXT = 4, OP_BAR_OUTLINE = 5, OP_BAR_FILL = 6, OP_URGENT_BORDER = 7, OP_REISSUE_BARS = 8, OP_CROSS = 9, OP_PROGRESS_META = 10, OP_SCHEDULE_PROGRESS_META = 11 };
+enum OpType : uint8_t { OP_CLEAR = 0, OP_RECT = 1, OP_FILL_RECT = 2, OP_LINE = 3, OP_TEXT = 4, OP_BAR_OUTLINE = 5, OP_BAR_FILL = 6, OP_URGENT_BORDER = 7, OP_REISSUE_BARS = 8, OP_CROSS = 9, OP_PROGRESS_META = 10, OP_SCHEDULE_PROGRESS_META = 11, OP_DOTTED_RECT = 12, OP_URGENT_TAB = 13 };
 enum FontType : uint8_t { FONT_MONO = 0, FONT_BOLD = 1 };
 enum ColorType : uint8_t { COLOR_BLACK = 0, COLOR_RED = 1, COLOR_WHITE = 2 };
 
@@ -325,6 +325,8 @@ bool fetchRenderJobNow(unsigned long jobId) {
     else if (opName == "urgent_border") ro.type = OP_URGENT_BORDER;
     else if (opName == "reissue_bars") ro.type = OP_REISSUE_BARS;
     else if (opName == "cross") ro.type = OP_CROSS;
+    else if (opName == "dotted_rect") ro.type = OP_DOTTED_RECT;
+    else if (opName == "urgent_tab") ro.type = OP_URGENT_TAB;
     else continue;
     renderOpCount++;
   }
@@ -395,6 +397,44 @@ void applyFont(uint8_t fontCode) {
   else display.setFont(&FreeMono9pt7b);
 }
 
+void drawDottedLine(int x1, int y1, int x2, int y2, uint16_t color) {
+  const int dash = 4;
+  const int gap = 4;
+  if (y1 == y2) {
+    int dir = (x2 >= x1) ? 1 : -1;
+    for (int x = x1; (dir > 0) ? (x < x2) : (x > x2); x += dir * (dash + gap)) {
+      int xe = x + dir * dash;
+      if ((dir > 0 && xe > x2) || (dir < 0 && xe < x2)) xe = x2;
+      display.drawLine(x, y1, xe, y2, color);
+    }
+  } else if (x1 == x2) {
+    int dir = (y2 >= y1) ? 1 : -1;
+    for (int y = y1; (dir > 0) ? (y < y2) : (y > y2); y += dir * (dash + gap)) {
+      int ye = y + dir * dash;
+      if ((dir > 0 && ye > y2) || (dir < 0 && ye < y2)) ye = y2;
+      display.drawLine(x1, y, x2, ye, color);
+    }
+  } else {
+    display.drawLine(x1, y1, x2, y2, color);
+  }
+}
+
+void drawDottedRectOp(const RenderOp &ro) {
+  uint16_t c = mapColor(ro.color);
+  drawDottedLine(ro.x, ro.y, ro.x + ro.w, ro.y, c);
+  drawDottedLine(ro.x, ro.y + ro.h, ro.x + ro.w, ro.y + ro.h, c);
+  drawDottedLine(ro.x, ro.y, ro.x, ro.y + ro.h, c);
+  drawDottedLine(ro.x + ro.w, ro.y, ro.x + ro.w, ro.y + ro.h, c);
+}
+
+void drawUrgentTabOp(const RenderOp &ro) {
+  uint16_t c = mapColor(ro.color);
+  int size = ro.value > 0 ? ro.value : 14;
+  for (int i = 0; i < size; i += 2) {
+    display.drawLine(ro.x + ro.w - size + i, ro.y + i, ro.x + ro.w, ro.y + i, c);
+  }
+}
+
 void executeRenderOpsOnce() {
   for (int i = 0; i < renderOpCount; i++) {
     RenderOp &ro = renderOps[i];
@@ -417,6 +457,12 @@ void executeRenderOpsOnce() {
       case OP_CROSS:
         display.drawLine(ro.x - 3, ro.y - 3, ro.x + 3, ro.y + 3, mapColor(ro.color));
         display.drawLine(ro.x - 3, ro.y + 3, ro.x + 3, ro.y - 3, mapColor(ro.color));
+        break;
+      case OP_DOTTED_RECT:
+        drawDottedRectOp(ro);
+        break;
+      case OP_URGENT_TAB:
+        drawUrgentTabOp(ro);
         break;
       default: break;
     }
@@ -583,7 +629,7 @@ void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("BOOT: DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA");
+  Serial.println("BOOT: DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V8_CALENDAR_ORDER_REISSUE");
   pinMode(PWR_PIN, OUTPUT); digitalWrite(PWR_PIN, LOW); pinMode(REFRESH_BUTTON, INPUT_PULLUP);
   connectPreferredOrFallback();
   updateBootStatusScreen("Booting...", activeAddress);
