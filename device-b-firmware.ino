@@ -8,11 +8,12 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <Update.h>
+#include "esp_heap_caps.h"
 #include <GxEPD2_3C.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
-#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V8_5_DEVICE_POLISH"
+#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V8_6_MEMORY_SAFE"
 
 #define CS 10
 #define DC 9
@@ -43,7 +44,7 @@ struct SavedNetwork {
   const char* password;
 };
 SavedNetwork preferredNetworks[] = {
-  {"VM6269662", "FollyDaRabbit123"},
+  {"ASUS", "le0pardess"},
   {"guest-dog", "givemeinternet"},
   {"Tomspot", "Tom00001"}
 };
@@ -66,6 +67,46 @@ DeviceState deviceState = STATE_IDLE;
 enum OpType : uint8_t { OP_CLEAR = 0, OP_RECT = 1, OP_FILL_RECT = 2, OP_LINE = 3, OP_TEXT = 4, OP_BAR_OUTLINE = 5, OP_BAR_FILL = 6, OP_URGENT_BORDER = 7, OP_REISSUE_BARS = 8, OP_CROSS = 9, OP_PROGRESS_META = 10, OP_SCHEDULE_PROGRESS_META = 11, OP_DOTTED_RECT = 12, OP_URGENT_TAB = 13, OP_DOTTED_LINE = 14 };
 enum FontType : uint8_t { FONT_MONO = 0, FONT_BOLD = 1, FONT_SMALL = 2 };
 enum ColorType : uint8_t { COLOR_BLACK = 0, COLOR_RED = 1, COLOR_WHITE = 2 };
+
+struct SpiRamAllocator {
+  void* allocate(size_t size) {
+    if (psramFound()) return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return malloc(size);
+  }
+  void deallocate(void* pointer) {
+    if (pointer) heap_caps_free(pointer);
+  }
+  void* reallocate(void* ptr, size_t new_size) {
+    if (psramFound()) return heap_caps_realloc(ptr, new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return realloc(ptr, new_size);
+  }
+};
+
+typedef BasicJsonDocument<SpiRamAllocator> PsramJsonDocument;
+
+String lastNetStage = "boot";
+String lastNetError = "none";
+String lastNetUrl = "";
+int lastHttpCode = 0;
+unsigned long lastNetMillis = 0;
+unsigned long lastLoopMillis = 0;
+unsigned long lastPollAttemptMillis = 0;
+unsigned long lastPollOkMillis = 0;
+unsigned long lastJobFetchOkMillis = 0;
+uint32_t lastPayloadFreeHeap = 0;
+uint32_t lastPayloadFreePsram = 0;
+size_t lastJsonCapacity = 0;
+size_t lastOpLimitHit = 0;
+
+void setDiag(const String &stage, const String &err = "") {
+  lastNetStage = stage;
+  if (err.length() > 0) lastNetError = err;
+  lastNetMillis = millis();
+  lastPayloadFreeHeap = ESP.getFreeHeap();
+  lastPayloadFreePsram = ESP.getFreePsram();
+}
+
+String stateName(DeviceState s);
 
 struct RenderOp {
   uint8_t type;
@@ -131,6 +172,8 @@ uint16_t mapColor(uint8_t colorCode);
 float progressFraction(const ProgressRegion &r);
 void updateProgressPartials();
 bool requestTimedMainRefresh();
+void handleFetchNow();
+void handleForceOtaLocal();
 
 bool waitForDisplay() {
   unsigned long start = millis();
@@ -229,58 +272,129 @@ void syncTimeNow() {
 
 
 bool httpGET(String url, String &out) {
-  if (usingFallbackAP) return false;
-  if (WiFi.status() != WL_CONNECTED) return false;
+  lastNetUrl = url;
+  lastHttpCode = 0;
+  setDiag("httpGET", "starting");
+  if (usingFallbackAP) { setDiag("httpGET", "fallback AP"); return false; }
+  if (WiFi.status() != WL_CONNECTED) { setDiag("httpGET", "wifi disconnected"); return false; }
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  if (!http.begin(client, url)) return false;
+  http.setTimeout(12000);
+  http.setReuse(false);
+  if (!http.begin(client, url)) { setDiag("httpGET", "begin failed"); return false; }
   int code = http.GET();
+  lastHttpCode = code;
   if (code != 200) {
     http.end();
+    setDiag("httpGET", String("HTTP ") + String(code));
     return false;
   }
   out = http.getString();
   http.end();
+  setDiag("httpGET", "ok");
   return true;
 }
 
 bool httpPOSTempty(String url) {
-  if (usingFallbackAP) return false;
-  if (WiFi.status() != WL_CONNECTED) return false;
+  lastNetUrl = url;
+  lastHttpCode = 0;
+  setDiag("httpPOST", "starting");
+  if (usingFallbackAP) { setDiag("httpPOST", "fallback AP"); return false; }
+  if (WiFi.status() != WL_CONNECTED) { setDiag("httpPOST", "wifi disconnected"); return false; }
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  if (!http.begin(client, url)) return false;
+  http.setTimeout(12000);
+  http.setReuse(false);
+  if (!http.begin(client, url)) { setDiag("httpPOST", "begin failed"); return false; }
   int code = http.POST("");
+  lastHttpCode = code;
   http.end();
-  return (code >= 200 && code < 300);
+  bool ok = (code >= 200 && code < 300);
+  setDiag("httpPOST", ok ? "ok" : (String("HTTP ") + String(code)));
+  return ok;
 }
 
 bool fetchRelayMetaNow(RelayMeta &meta) {
-  String payload;
+  lastPollAttemptMillis = millis();
   String url = String(relayBaseUrl) + "/api/meta?token=" + relayToken;
-  if (!httpGET(url, payload)) return false;
+  lastNetUrl = url;
+  lastHttpCode = 0;
+  setDiag("meta", "starting");
+  if (usingFallbackAP) { setDiag("meta", "fallback AP"); return false; }
+  if (WiFi.status() != WL_CONNECTED) { setDiag("meta", "wifi disconnected"); return false; }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(12000);
+  http.setReuse(false);
+  if (!http.begin(client, url)) { setDiag("meta", "begin failed"); return false; }
+  int code = http.GET();
+  lastHttpCode = code;
+  if (code != 200) {
+    http.end();
+    setDiag("meta", String("HTTP ") + String(code));
+    return false;
+  }
+
   DynamicJsonDocument doc(2048);
-  DeserializationError err = deserializeJson(doc, payload);
-  if (err) return false;
+  DeserializationError err = deserializeJson(doc, http.getStream());
+  http.end();
+  if (err) {
+    setDiag("meta", String("json ") + err.c_str());
+    return false;
+  }
   meta.pageRevision = doc["page_revision"] | 0;
   meta.pageType = doc["page_type"] | "main";
   meta.jobId = doc["job_id"] | 0;
   meta.refreshRequested = doc["refresh_requested"] | 0;
   meta.forceOTA = doc["force_ota"] | 0;
   meta.firmwareVersionFromRelay = doc["firmware_version"] | "";
+  lastPollOkMillis = millis();
+  setDiag("meta", "ok");
   return true;
 }
 
 bool fetchRenderJobNow(unsigned long jobId) {
-  String payload;
   String url = String(relayBaseUrl) + "/api/render_job?token=" + relayToken + "&job_id=" + String(jobId);
-  if (!httpGET(url, payload)) return false;
-  DynamicJsonDocument doc(65536);
-  DeserializationError err = deserializeJson(doc, payload);
-  if (err) return false;
-  if (!(doc["ok"] | false)) return false;
+  lastNetUrl = url;
+  lastHttpCode = 0;
+  lastOpLimitHit = 0;
+  setDiag("render_job", "starting");
+  if (usingFallbackAP) { setDiag("render_job", "fallback AP"); return false; }
+  if (WiFi.status() != WL_CONNECTED) { setDiag("render_job", "wifi disconnected"); return false; }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(20000);
+  http.setReuse(false);
+  if (!http.begin(client, url)) { setDiag("render_job", "begin failed"); return false; }
+  int code = http.GET();
+  lastHttpCode = code;
+  if (code != 200) {
+    http.end();
+    setDiag("render_job", String("HTTP ") + String(code));
+    return false;
+  }
+
+  size_t cap = psramFound() ? 131072 : 65536;
+  lastJsonCapacity = cap;
+  PsramJsonDocument doc(cap);
+  if (doc.capacity() == 0) {
+    http.end();
+    setDiag("render_job", "json alloc failed");
+    return false;
+  }
+  DeserializationError err = deserializeJson(doc, http.getStream());
+  http.end();
+  if (err) {
+    setDiag("render_job", String("json ") + err.c_str());
+    return false;
+  }
+  if (!(doc["ok"] | false)) { setDiag("render_job", "ok=false"); return false; }
   currentPageType = doc["page_type"].as<String>();
   JsonArray ops = doc["payload"]["ops"].as<JsonArray>();
   renderOpCount = 0;
@@ -308,7 +422,7 @@ bool fetchRenderJobNow(unsigned long jobId) {
       continue;
     }
 
-    if (renderOpCount >= MAX_OPS) break;
+    if (renderOpCount >= MAX_OPS) { lastOpLimitHit++; continue; }
     RenderOp &ro = renderOps[renderOpCount];
     ro.x = op["x"] | 0; ro.y = op["y"] | 0; ro.x2 = op["x1"] | op["x2"] | 0; ro.y2 = op["y1"] | op["y2"] | 0;
     ro.w = op["w"] | 0; ro.h = op["h"] | 0; ro.value = op["count"] | 0;
@@ -331,6 +445,8 @@ bool fetchRenderJobNow(unsigned long jobId) {
     else continue;
     renderOpCount++;
   }
+  lastJobFetchOkMillis = millis();
+  setDiag("render_job", "ok");
   return true;
 }
 
@@ -373,7 +489,8 @@ bool checkForOTA(unsigned long forceFlag) {
   if (!httpGET(url, payload)) return false;
 
   DynamicJsonDocument doc(1024);
-  if (deserializeJson(doc, payload)) return false;
+  DeserializationError otaErr = deserializeJson(doc, payload);
+  if (otaErr) { setDiag("ota", String("json ") + otaErr.c_str()); return false; }
 
   String newVersion = doc["version"] | "";
   String binUrl = doc["url"] | "";
@@ -560,19 +677,81 @@ void updateBootStatusScreen(const String &line1, const String &line2) {
   displaySleep(); refreshInProgress = false;
 }
 
+String stateName(DeviceState s) {
+  switch (s) {
+    case STATE_IDLE: return "IDLE";
+    case STATE_POLL_META: return "POLL_META";
+    case STATE_FETCH_JOB: return "FETCH_JOB";
+    case STATE_RENDER_JOB: return "RENDER_JOB";
+    case STATE_ACK_JOB: return "ACK_JOB";
+    case STATE_COOLDOWN: return "COOLDOWN";
+    default: return "UNKNOWN";
+  }
+}
+
 String localWebpage() {
   String page = "<html><body>";
   page += "<h2>"; page += BUILD_VERSION; page += "</h2>";
   page += "<p>Mode: "; page += usingFallbackAP ? "Fallback AP" : "Preferred WiFi"; page += "<br>Address: "; page += activeAddress;
   if (mdnsActive) page += "<br>mDNS: taskdevice.local";
-  page += "<br>Current page: "; page += currentPageType; page += "</p>";
-  page += "<form action='/refresh'><input type='submit' value='Refresh Device'></form>";
+  page += "<br>Current page: "; page += currentPageType;
+  page += "<br>State: "; page += stateName(deviceState);
+  page += "<br>Target job: "; page += String(targetJobId);
+  page += "<br>Last acked job: "; page += String(lastAckedJobId);
+  page += "<br>Queued: "; page += renderJobQueued ? "yes" : "no";
+  page += "<br>Refresh busy: "; page += refreshInProgress ? "yes" : "no";
+  page += "</p>";
+  page += "<h3>Diagnostics</h3><p>";
+  page += "Last stage: "; page += lastNetStage;
+  page += "<br>Last error: "; page += lastNetError;
+  page += "<br>HTTP code: "; page += String(lastHttpCode);
+  page += "<br>Last URL: "; page += lastNetUrl;
+  page += "<br>Last poll attempt ms: "; page += String(lastPollAttemptMillis);
+  page += "<br>Last poll OK ms: "; page += String(lastPollOkMillis);
+  page += "<br>Last job OK ms: "; page += String(lastJobFetchOkMillis);
+  page += "<br>Free heap: "; page += String(ESP.getFreeHeap());
+  page += "<br>Free PSRAM: "; page += String(ESP.getFreePsram());
+  page += "<br>PSRAM found: "; page += psramFound() ? "yes" : "no";
+  page += "<br>JSON cap: "; page += String(lastJsonCapacity);
+  page += "<br>Ops loaded: "; page += String(renderOpCount);
+  page += "<br>Ops dropped: "; page += String(lastOpLimitHit);
+  page += "</p>";
+  page += "<form action='/refresh'><input type='submit' value='Fetch + Refresh Device'></form>";
+  page += "<form action='/fetch_now' style='margin-top:10px;'><input type='submit' value='Fetch Metadata Only'></form>";
+  page += "<form action='/force_ota_local' style='margin-top:10px;' onsubmit=\"return confirm('Force OTA from relay firmware URL?');\"><input type='submit' value='Local Force OTA'></form>";
   page += "</body></html>";
   return page;
 }
 
 void handleRoot() { server.send(200, "text/html", localWebpage()); }
-void handleRefresh() { if (!refreshInProgress) renderJobQueued = true; server.sendHeader("Location", "/"); server.send(303); }
+
+void handleFetchNow() {
+  if (fetchRelayMetaNow(latestMeta)) {
+    targetJobId = latestMeta.jobId;
+    if (latestMeta.jobId > lastAckedJobId || latestMeta.refreshRequested) renderJobQueued = true;
+    if (latestMeta.forceOTA) checkForOTA(1);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleRefresh() {
+  if (!refreshInProgress) {
+    if (targetJobId == 0) {
+      if (fetchRelayMetaNow(latestMeta)) targetJobId = latestMeta.jobId;
+    }
+    if (targetJobId > 0) renderJobQueued = true;
+    else deviceState = STATE_POLL_META;
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleForceOtaLocal() {
+  checkForOTA(1);
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
 
 bool requestTimedMainRefresh() {
   if (usingFallbackAP) return false;
@@ -593,7 +772,8 @@ void handleButtonRefresh() {
   static unsigned long lastButtonAction = 0;
   if (digitalRead(REFRESH_BUTTON) == LOW) {
     if (millis() - lastButtonAction > 1200) {
-      renderJobQueued = true;
+      if (targetJobId == 0) deviceState = STATE_POLL_META;
+      else renderJobQueued = true;
       lastButtonAction = millis();
     }
   }
@@ -602,7 +782,8 @@ void handleButtonRefresh() {
 void runStateMachine() {
   switch (deviceState) {
     case STATE_IDLE:
-      if (millis() - lastMetaPoll > metaPollInterval) deviceState = STATE_POLL_META;
+      if (renderJobQueued && targetJobId == 0 && !refreshInProgress) deviceState = STATE_POLL_META;
+      else if (millis() - lastMetaPoll > metaPollInterval) deviceState = STATE_POLL_META;
       else if (renderJobQueued && targetJobId > 0 && !refreshInProgress) deviceState = STATE_FETCH_JOB;
       break;
     case STATE_POLL_META:
@@ -614,7 +795,7 @@ void runStateMachine() {
       lastMetaPoll = millis(); deviceState = STATE_IDLE; break;
     case STATE_FETCH_JOB:
       if (targetJobId > 0 && fetchRenderJobNow(targetJobId)) { Serial.print("FETCH JOB OK: "); Serial.println(targetJobId); deviceState = STATE_RENDER_JOB; }
-      else { Serial.println("FETCH JOB FAIL"); deviceState = STATE_IDLE; }
+      else { Serial.println("FETCH JOB FAIL"); renderJobQueued = false; targetJobId = 0; deviceState = STATE_IDLE; }
       break;
     case STATE_RENDER_JOB:
       if (!refreshInProgress) { updateDisplayFromRenderOps(); deviceState = STATE_ACK_JOB; }
@@ -635,14 +816,17 @@ void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("BOOT: DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V8_CALENDAR_ORDER_REISSUE");
+  Serial.println("BOOT: DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V8_6_MEMORY_SAFE");
+  psramInit();
+  Serial.print("PSRAM FOUND: "); Serial.println(psramFound() ? "yes" : "no");
+  Serial.print("FREE PSRAM: "); Serial.println(ESP.getFreePsram());
   pinMode(PWR_PIN, OUTPUT); digitalWrite(PWR_PIN, LOW); pinMode(REFRESH_BUTTON, INPUT_PULLUP);
   connectPreferredOrFallback();
   updateBootStatusScreen("Booting...", activeAddress);
   Serial.print("WIFI MODE: "); Serial.println(usingFallbackAP ? "Fallback AP" : "Preferred WiFi");
   Serial.print("ADDRESS: "); Serial.println(activeAddress);
   syncTimeNow();
-  server.on("/", handleRoot); server.on("/refresh", handleRefresh); server.begin();
+  server.on("/", handleRoot); server.on("/refresh", handleRefresh); server.on("/fetch_now", handleFetchNow); server.on("/force_ota_local", handleForceOtaLocal); server.begin();
   Serial.println("WEB SERVER STARTED");
   if (fetchRelayMetaNow(latestMeta)) {
     Serial.println("META OK");
@@ -658,6 +842,7 @@ void setup() {
 }
 
 void loop() {
+  lastLoopMillis = millis();
   server.handleClient();
   if (!usingFallbackAP && (millis() - lastTimeSync > timeSyncInterval)) syncTimeNow();
   handleButtonRefresh();
