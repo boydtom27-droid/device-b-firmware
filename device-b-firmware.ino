@@ -8,12 +8,11 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <Update.h>
-#include "esp_heap_caps.h"
 #include <GxEPD2_3C.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
-#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V8_6_MEMORY_SAFE"
+#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V8_6_NEVER_FAIL_RENDER_COMPAT"
 
 #define CS 10
 #define DC 9
@@ -68,46 +67,6 @@ enum OpType : uint8_t { OP_CLEAR = 0, OP_RECT = 1, OP_FILL_RECT = 2, OP_LINE = 3
 enum FontType : uint8_t { FONT_MONO = 0, FONT_BOLD = 1, FONT_SMALL = 2 };
 enum ColorType : uint8_t { COLOR_BLACK = 0, COLOR_RED = 1, COLOR_WHITE = 2 };
 
-struct SpiRamAllocator {
-  void* allocate(size_t size) {
-    if (psramFound()) return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return malloc(size);
-  }
-  void deallocate(void* pointer) {
-    if (pointer) heap_caps_free(pointer);
-  }
-  void* reallocate(void* ptr, size_t new_size) {
-    if (psramFound()) return heap_caps_realloc(ptr, new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return realloc(ptr, new_size);
-  }
-};
-
-typedef BasicJsonDocument<SpiRamAllocator> PsramJsonDocument;
-
-String lastNetStage = "boot";
-String lastNetError = "none";
-String lastNetUrl = "";
-int lastHttpCode = 0;
-unsigned long lastNetMillis = 0;
-unsigned long lastLoopMillis = 0;
-unsigned long lastPollAttemptMillis = 0;
-unsigned long lastPollOkMillis = 0;
-unsigned long lastJobFetchOkMillis = 0;
-uint32_t lastPayloadFreeHeap = 0;
-uint32_t lastPayloadFreePsram = 0;
-size_t lastJsonCapacity = 0;
-size_t lastOpLimitHit = 0;
-
-void setDiag(const String &stage, const String &err = "") {
-  lastNetStage = stage;
-  if (err.length() > 0) lastNetError = err;
-  lastNetMillis = millis();
-  lastPayloadFreeHeap = ESP.getFreeHeap();
-  lastPayloadFreePsram = ESP.getFreePsram();
-}
-
-String stateName(DeviceState s);
-
 struct RenderOp {
   uint8_t type;
   int16_t x;
@@ -151,6 +110,23 @@ struct RelayMeta {
 };
 RelayMeta latestMeta;
 
+// --- Local diagnostics / never-fail state ---
+long lastHttpCode = 0;
+String lastHttpPath = "none";
+String lastHttpError = "none";
+unsigned long lastHttpAttemptMs = 0;
+unsigned long lastHttpSuccessMs = 0;
+unsigned long lastMetaOkMs = 0;
+unsigned long lastMetaFailMs = 0;
+unsigned long lastJobOkMs = 0;
+unsigned long lastJobFailMs = 0;
+unsigned long bootMs = 0;
+unsigned long pollCount = 0;
+unsigned long pollFailCount = 0;
+unsigned long jobFailCount = 0;
+int droppedOps = 0;
+String lastJsonError = "none";
+
 bool tryConnectOneNetwork(const char* ssid, const char* password, unsigned long timeoutMs);
 void stopMDNS();
 void startFallbackAP();
@@ -172,8 +148,10 @@ uint16_t mapColor(uint8_t colorCode);
 float progressFraction(const ProgressRegion &r);
 void updateProgressPartials();
 bool requestTimedMainRefresh();
+bool fetchMetaAndQueue(const char* reason);
+String msAgo(unsigned long t);
 void handleFetchNow();
-void handleForceOtaLocal();
+void handleForceOTALocal();
 
 bool waitForDisplay() {
   unsigned long start = millis();
@@ -272,133 +250,102 @@ void syncTimeNow() {
 
 
 bool httpGET(String url, String &out) {
-  lastNetUrl = url;
-  lastHttpCode = 0;
-  setDiag("httpGET", "starting");
-  if (usingFallbackAP) { setDiag("httpGET", "fallback AP"); return false; }
-  if (WiFi.status() != WL_CONNECTED) { setDiag("httpGET", "wifi disconnected"); return false; }
+  lastHttpAttemptMs = millis();
+  lastHttpPath = url;
+  lastHttpCode = -999;
+  lastHttpError = "start";
+
+  if (usingFallbackAP) { lastHttpError = "fallback_ap"; return false; }
+  if (WiFi.status() != WL_CONNECTED) { lastHttpError = "wifi_not_connected"; return false; }
+
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  http.setTimeout(12000);
-  http.setReuse(false);
-  if (!http.begin(client, url)) { setDiag("httpGET", "begin failed"); return false; }
+  http.setTimeout(15000);
+  if (!http.begin(client, url)) { lastHttpError = "http_begin_fail"; return false; }
   int code = http.GET();
   lastHttpCode = code;
   if (code != 200) {
+    lastHttpError = String("http_") + String(code);
     http.end();
-    setDiag("httpGET", String("HTTP ") + String(code));
     return false;
   }
   out = http.getString();
   http.end();
-  setDiag("httpGET", "ok");
+  lastHttpSuccessMs = millis();
+  lastHttpError = "none";
   return true;
 }
 
 bool httpPOSTempty(String url) {
-  lastNetUrl = url;
-  lastHttpCode = 0;
-  setDiag("httpPOST", "starting");
-  if (usingFallbackAP) { setDiag("httpPOST", "fallback AP"); return false; }
-  if (WiFi.status() != WL_CONNECTED) { setDiag("httpPOST", "wifi disconnected"); return false; }
+  lastHttpAttemptMs = millis();
+  lastHttpPath = url;
+  lastHttpCode = -999;
+  lastHttpError = "post_start";
+
+  if (usingFallbackAP) { lastHttpError = "fallback_ap"; return false; }
+  if (WiFi.status() != WL_CONNECTED) { lastHttpError = "wifi_not_connected"; return false; }
+
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  http.setTimeout(12000);
-  http.setReuse(false);
-  if (!http.begin(client, url)) { setDiag("httpPOST", "begin failed"); return false; }
+  http.setTimeout(15000);
+  if (!http.begin(client, url)) { lastHttpError = "http_begin_fail"; return false; }
   int code = http.POST("");
   lastHttpCode = code;
   http.end();
-  bool ok = (code >= 200 && code < 300);
-  setDiag("httpPOST", ok ? "ok" : (String("HTTP ") + String(code)));
-  return ok;
+  if (code >= 200 && code < 300) {
+    lastHttpSuccessMs = millis();
+    lastHttpError = "none";
+    return true;
+  }
+  lastHttpError = String("post_http_") + String(code);
+  return false;
 }
 
 bool fetchRelayMetaNow(RelayMeta &meta) {
-  lastPollAttemptMillis = millis();
+  String payload;
   String url = String(relayBaseUrl) + "/api/meta?token=" + relayToken;
-  lastNetUrl = url;
-  lastHttpCode = 0;
-  setDiag("meta", "starting");
-  if (usingFallbackAP) { setDiag("meta", "fallback AP"); return false; }
-  if (WiFi.status() != WL_CONNECTED) { setDiag("meta", "wifi disconnected"); return false; }
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(12000);
-  http.setReuse(false);
-  if (!http.begin(client, url)) { setDiag("meta", "begin failed"); return false; }
-  int code = http.GET();
-  lastHttpCode = code;
-  if (code != 200) {
-    http.end();
-    setDiag("meta", String("HTTP ") + String(code));
+  pollCount++;
+  if (!httpGET(url, payload)) {
+    pollFailCount++;
+    lastMetaFailMs = millis();
     return false;
   }
 
   DynamicJsonDocument doc(2048);
-  DeserializationError err = deserializeJson(doc, http.getStream());
-  http.end();
+  DeserializationError err = deserializeJson(doc, payload);
   if (err) {
-    setDiag("meta", String("json ") + err.c_str());
+    pollFailCount++;
+    lastMetaFailMs = millis();
+    lastJsonError = String("meta:") + err.c_str();
     return false;
   }
+
   meta.pageRevision = doc["page_revision"] | 0;
   meta.pageType = doc["page_type"] | "main";
   meta.jobId = doc["job_id"] | 0;
   meta.refreshRequested = doc["refresh_requested"] | 0;
   meta.forceOTA = doc["force_ota"] | 0;
   meta.firmwareVersionFromRelay = doc["firmware_version"] | "";
-  lastPollOkMillis = millis();
-  setDiag("meta", "ok");
+  lastMetaOkMs = millis();
+  lastJsonError = "none";
   return true;
 }
 
 bool fetchRenderJobNow(unsigned long jobId) {
+  String payload;
   String url = String(relayBaseUrl) + "/api/render_job?token=" + relayToken + "&job_id=" + String(jobId);
-  lastNetUrl = url;
-  lastHttpCode = 0;
-  lastOpLimitHit = 0;
-  setDiag("render_job", "starting");
-  if (usingFallbackAP) { setDiag("render_job", "fallback AP"); return false; }
-  if (WiFi.status() != WL_CONNECTED) { setDiag("render_job", "wifi disconnected"); return false; }
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(20000);
-  http.setReuse(false);
-  if (!http.begin(client, url)) { setDiag("render_job", "begin failed"); return false; }
-  int code = http.GET();
-  lastHttpCode = code;
-  if (code != 200) {
-    http.end();
-    setDiag("render_job", String("HTTP ") + String(code));
-    return false;
-  }
-
-  size_t cap = psramFound() ? 131072 : 65536;
-  lastJsonCapacity = cap;
-  PsramJsonDocument doc(cap);
-  if (doc.capacity() == 0) {
-    http.end();
-    setDiag("render_job", "json alloc failed");
-    return false;
-  }
-  DeserializationError err = deserializeJson(doc, http.getStream());
-  http.end();
-  if (err) {
-    setDiag("render_job", String("json ") + err.c_str());
-    return false;
-  }
-  if (!(doc["ok"] | false)) { setDiag("render_job", "ok=false"); return false; }
+  if (!httpGET(url, payload)) { jobFailCount++; lastJobFailMs = millis(); return false; }
+  DynamicJsonDocument doc(98304);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) { jobFailCount++; lastJobFailMs = millis(); lastJsonError = String("job:") + err.c_str(); return false; }
+  if (!(doc["ok"] | false)) { jobFailCount++; lastJobFailMs = millis(); lastJsonError = "job:not_ok"; return false; }
   currentPageType = doc["page_type"].as<String>();
   JsonArray ops = doc["payload"]["ops"].as<JsonArray>();
   renderOpCount = 0;
   progressRegionCount = 0;
+  droppedOps = 0;
   for (JsonObject op : ops) {
     String opName = op["op"] | "";
 
@@ -422,7 +369,7 @@ bool fetchRenderJobNow(unsigned long jobId) {
       continue;
     }
 
-    if (renderOpCount >= MAX_OPS) { lastOpLimitHit++; continue; }
+    if (renderOpCount >= MAX_OPS) { droppedOps++; continue; }
     RenderOp &ro = renderOps[renderOpCount];
     ro.x = op["x"] | 0; ro.y = op["y"] | 0; ro.x2 = op["x1"] | op["x2"] | 0; ro.y2 = op["y1"] | op["y2"] | 0;
     ro.w = op["w"] | 0; ro.h = op["h"] | 0; ro.value = op["count"] | 0;
@@ -445,8 +392,8 @@ bool fetchRenderJobNow(unsigned long jobId) {
     else continue;
     renderOpCount++;
   }
-  lastJobFetchOkMillis = millis();
-  setDiag("render_job", "ok");
+  lastJobOkMs = millis();
+  lastJsonError = "none";
   return true;
 }
 
@@ -489,8 +436,7 @@ bool checkForOTA(unsigned long forceFlag) {
   if (!httpGET(url, payload)) return false;
 
   DynamicJsonDocument doc(1024);
-  DeserializationError otaErr = deserializeJson(doc, payload);
-  if (otaErr) { setDiag("ota", String("json ") + otaErr.c_str()); return false; }
+  if (deserializeJson(doc, payload)) return false;
 
   String newVersion = doc["version"] | "";
   String binUrl = doc["url"] | "";
@@ -677,77 +623,102 @@ void updateBootStatusScreen(const String &line1, const String &line2) {
   displaySleep(); refreshInProgress = false;
 }
 
-String stateName(DeviceState s) {
-  switch (s) {
+String msAgo(unsigned long t) {
+  if (t == 0) return "never";
+  unsigned long age = (millis() - t) / 1000UL;
+  return String(age) + "s ago";
+}
+
+String stateName() {
+  switch (deviceState) {
     case STATE_IDLE: return "IDLE";
     case STATE_POLL_META: return "POLL_META";
     case STATE_FETCH_JOB: return "FETCH_JOB";
     case STATE_RENDER_JOB: return "RENDER_JOB";
     case STATE_ACK_JOB: return "ACK_JOB";
     case STATE_COOLDOWN: return "COOLDOWN";
-    default: return "UNKNOWN";
   }
+  return "?";
 }
 
 String localWebpage() {
-  String page = "<html><body>";
+  String page = "<html><body style='font-family:sans-serif'>";
   page += "<h2>"; page += BUILD_VERSION; page += "</h2>";
-  page += "<p>Mode: "; page += usingFallbackAP ? "Fallback AP" : "Preferred WiFi"; page += "<br>Address: "; page += activeAddress;
+  page += "<p>Mode: "; page += usingFallbackAP ? "Fallback AP" : "Preferred WiFi";
+  page += "<br>Address: "; page += activeAddress;
   if (mdnsActive) page += "<br>mDNS: taskdevice.local";
   page += "<br>Current page: "; page += currentPageType;
-  page += "<br>State: "; page += stateName(deviceState);
+  page += "<br>State: "; page += stateName();
   page += "<br>Target job: "; page += String(targetJobId);
   page += "<br>Last acked job: "; page += String(lastAckedJobId);
   page += "<br>Queued: "; page += renderJobQueued ? "yes" : "no";
-  page += "<br>Refresh busy: "; page += refreshInProgress ? "yes" : "no";
+  page += "<br>Refresh in progress: "; page += refreshInProgress ? "yes" : "no";
   page += "</p>";
+
+  page += "<form action='/refresh' style='display:inline-block;margin-right:12px'><input type='submit' value='Refresh Device'></form>";
+  page += "<form action='/fetch_now' style='display:inline-block;margin-right:12px'><input type='submit' value='Fetch relay now'></form>";
+  page += "<form action='/force_ota_local' style='display:inline-block' onsubmit='return confirm(\"Force local OTA check now?\")'><input type='submit' value='Force OTA local'></form>";
+
   page += "<h3>Diagnostics</h3><p>";
-  page += "Last stage: "; page += lastNetStage;
-  page += "<br>Last error: "; page += lastNetError;
-  page += "<br>HTTP code: "; page += String(lastHttpCode);
-  page += "<br>Last URL: "; page += lastNetUrl;
-  page += "<br>Last poll attempt ms: "; page += String(lastPollAttemptMillis);
-  page += "<br>Last poll OK ms: "; page += String(lastPollOkMillis);
-  page += "<br>Last job OK ms: "; page += String(lastJobFetchOkMillis);
-  page += "<br>Free heap: "; page += String(ESP.getFreeHeap());
-  page += "<br>Free PSRAM: "; page += String(ESP.getFreePsram());
-  page += "<br>PSRAM found: "; page += psramFound() ? "yes" : "no";
-  page += "<br>JSON cap: "; page += String(lastJsonCapacity);
-  page += "<br>Ops loaded: "; page += String(renderOpCount);
-  page += "<br>Ops dropped: "; page += String(lastOpLimitHit);
-  page += "</p>";
-  page += "<form action='/refresh'><input type='submit' value='Fetch + Refresh Device'></form>";
-  page += "<form action='/fetch_now' style='margin-top:10px;'><input type='submit' value='Fetch Metadata Only'></form>";
-  page += "<form action='/force_ota_local' style='margin-top:10px;' onsubmit=\"return confirm('Force OTA from relay firmware URL?');\"><input type='submit' value='Local Force OTA'></form>";
-  page += "</body></html>";
+  page += "Uptime: "; page += String((millis() - bootMs) / 1000UL); page += "s";
+  page += "<br>WiFi status: "; page += String((int)WiFi.status());
+  page += "<br>RSSI: "; page += String(WiFi.RSSI());
+  page += "<br>Heap free: "; page += String(ESP.getFreeHeap());
+  page += "<br>Heap min: "; page += String(ESP.getMinFreeHeap());
+  page += "<br>PSRAM size/free: "; page += String(ESP.getPsramSize()); page += " / "; page += String(ESP.getFreePsram());
+  page += "<br>Last HTTP code: "; page += String(lastHttpCode);
+  page += "<br>Last HTTP err: "; page += lastHttpError;
+  page += "<br>Last HTTP attempt: "; page += msAgo(lastHttpAttemptMs);
+  page += "<br>Last HTTP success: "; page += msAgo(lastHttpSuccessMs);
+  page += "<br>Last meta OK: "; page += msAgo(lastMetaOkMs);
+  page += "<br>Last meta fail: "; page += msAgo(lastMetaFailMs);
+  page += "<br>Last job OK: "; page += msAgo(lastJobOkMs);
+  page += "<br>Last job fail: "; page += msAgo(lastJobFailMs);
+  page += "<br>Polls/fails: "; page += String(pollCount); page += " / "; page += String(pollFailCount);
+  page += "<br>Job fails: "; page += String(jobFailCount);
+  page += "<br>Ops loaded/dropped: "; page += String(renderOpCount); page += " / "; page += String(droppedOps);
+  page += "<br>Last JSON err: "; page += lastJsonError;
+  page += "<br>Last URL: <small>"; page += lastHttpPath; page += "</small>";
+  page += "</p></body></html>";
   return page;
 }
 
 void handleRoot() { server.send(200, "text/html", localWebpage()); }
 
-void handleFetchNow() {
+bool fetchMetaAndQueue(const char* reason) {
+  (void)reason;
   if (fetchRelayMetaNow(latestMeta)) {
-    targetJobId = latestMeta.jobId;
-    if (latestMeta.jobId > lastAckedJobId || latestMeta.refreshRequested) renderJobQueued = true;
+    if (latestMeta.jobId > 0) {
+      targetJobId = latestMeta.jobId;
+      if (latestMeta.jobId > lastAckedJobId || latestMeta.refreshRequested) {
+        renderJobQueued = true;
+      }
+    }
     if (latestMeta.forceOTA) checkForOTA(1);
+    lastMetaPoll = millis();
+    return true;
   }
-  server.sendHeader("Location", "/");
-  server.send(303);
+  lastMetaPoll = millis();
+  return false;
 }
 
 void handleRefresh() {
   if (!refreshInProgress) {
-    if (targetJobId == 0) {
-      if (fetchRelayMetaNow(latestMeta)) targetJobId = latestMeta.jobId;
-    }
+    fetchMetaAndQueue("local_refresh");
     if (targetJobId > 0) renderJobQueued = true;
-    else deviceState = STATE_POLL_META;
   }
   server.sendHeader("Location", "/");
   server.send(303);
 }
 
-void handleForceOtaLocal() {
+void handleFetchNow() {
+  if (!refreshInProgress) fetchMetaAndQueue("local_fetch_now");
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleForceOTALocal() {
+  otaAttemptedThisBoot = false;
   checkForOTA(1);
   server.sendHeader("Location", "/");
   server.send(303);
@@ -787,15 +758,12 @@ void runStateMachine() {
       else if (renderJobQueued && targetJobId > 0 && !refreshInProgress) deviceState = STATE_FETCH_JOB;
       break;
     case STATE_POLL_META:
-      if (fetchRelayMetaNow(latestMeta)) {
-        Serial.println("POLL META OK");
-        if (latestMeta.jobId > lastAckedJobId || latestMeta.refreshRequested) { targetJobId = latestMeta.jobId; renderJobQueued = true; }
-        if (latestMeta.forceOTA) checkForOTA(1);
-      } else Serial.println("POLL META FAIL");
-      lastMetaPoll = millis(); deviceState = STATE_IDLE; break;
+      if (fetchMetaAndQueue("poll")) Serial.println("POLL META OK");
+      else Serial.println("POLL META FAIL");
+      deviceState = STATE_IDLE; break;
     case STATE_FETCH_JOB:
       if (targetJobId > 0 && fetchRenderJobNow(targetJobId)) { Serial.print("FETCH JOB OK: "); Serial.println(targetJobId); deviceState = STATE_RENDER_JOB; }
-      else { Serial.println("FETCH JOB FAIL"); renderJobQueued = false; targetJobId = 0; deviceState = STATE_IDLE; }
+      else { Serial.println("FETCH JOB FAIL"); renderJobQueued = false; deviceState = STATE_IDLE; }
       break;
     case STATE_RENDER_JOB:
       if (!refreshInProgress) { updateDisplayFromRenderOps(); deviceState = STATE_ACK_JOB; }
@@ -812,38 +780,44 @@ void runStateMachine() {
 
 void setup() {
   otaAttemptedThisBoot = false;
+  bootMs = millis();
 
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("BOOT: DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V8_6_MEMORY_SAFE");
-  psramInit();
-  Serial.print("PSRAM FOUND: "); Serial.println(psramFound() ? "yes" : "no");
-  Serial.print("FREE PSRAM: "); Serial.println(ESP.getFreePsram());
+  Serial.println("BOOT: DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V8_CALENDAR_ORDER_REISSUE");
   pinMode(PWR_PIN, OUTPUT); digitalWrite(PWR_PIN, LOW); pinMode(REFRESH_BUTTON, INPUT_PULLUP);
   connectPreferredOrFallback();
   updateBootStatusScreen("Booting...", activeAddress);
   Serial.print("WIFI MODE: "); Serial.println(usingFallbackAP ? "Fallback AP" : "Preferred WiFi");
   Serial.print("ADDRESS: "); Serial.println(activeAddress);
   syncTimeNow();
-  server.on("/", handleRoot); server.on("/refresh", handleRefresh); server.on("/fetch_now", handleFetchNow); server.on("/force_ota_local", handleForceOtaLocal); server.begin();
+  server.on("/", handleRoot); server.on("/refresh", handleRefresh); server.on("/fetch_now", handleFetchNow); server.on("/force_ota_local", handleForceOTALocal); server.begin();
   Serial.println("WEB SERVER STARTED");
-  if (fetchRelayMetaNow(latestMeta)) {
+  if (fetchMetaAndQueue("boot")) {
     Serial.println("META OK");
-    targetJobId = latestMeta.jobId;
     if (targetJobId > 0 && fetchRenderJobNow(targetJobId)) {
       Serial.print("JOB FETCH OK: "); Serial.println(targetJobId);
-      updateDisplayFromRenderOps(); ackCurrentJob(targetJobId); lastAckedJobId = targetJobId;
-    } else updateBootStatusScreen("Relay online", "No job");
-  } else updateBootStatusScreen("Relay fetch fail", activeAddress);
+      updateDisplayFromRenderOps();
+      if (ackCurrentJob(targetJobId)) lastAckedJobId = targetJobId;
+      renderJobQueued = false;
+    } else {
+      updateBootStatusScreen("Relay online", "No job/fetch fail");
+    }
+  } else {
+    updateBootStatusScreen("Relay fetch fail", activeAddress);
+  }
   lastMetaPoll = millis();
   lastTimedFullRefresh = millis();
   deviceState = STATE_IDLE;
 }
 
 void loop() {
-  lastLoopMillis = millis();
   server.handleClient();
+  if (!usingFallbackAP && WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost - reconnecting");
+    connectPreferredOrFallback();
+  }
   if (!usingFallbackAP && (millis() - lastTimeSync > timeSyncInterval)) syncTimeNow();
   handleButtonRefresh();
   runStateMachine();
