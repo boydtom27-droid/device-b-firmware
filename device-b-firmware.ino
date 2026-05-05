@@ -12,7 +12,7 @@
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
-#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V8_CALENDAR_ORDER_REISSUE"
+#define BUILD_VERSION "DEVICE_B_STABLE_MILESTONE_3_GRAPH_OTA_V8_5_DEVICE_POLISH"
 
 #define CS 10
 #define DC 9
@@ -43,7 +43,7 @@ struct SavedNetwork {
   const char* password;
 };
 SavedNetwork preferredNetworks[] = {
-  {"ASUS", "le0pardess"},
+  {"VM6269662", "FollyDaRabbit123"},
   {"guest-dog", "givemeinternet"},
   {"Tomspot", "Tom00001"}
 };
@@ -63,8 +63,8 @@ bool otaAttemptedThisBoot = false;
 enum DeviceState { STATE_IDLE, STATE_POLL_META, STATE_FETCH_JOB, STATE_RENDER_JOB, STATE_ACK_JOB, STATE_COOLDOWN };
 DeviceState deviceState = STATE_IDLE;
 
-enum OpType : uint8_t { OP_CLEAR = 0, OP_RECT = 1, OP_FILL_RECT = 2, OP_LINE = 3, OP_TEXT = 4, OP_BAR_OUTLINE = 5, OP_BAR_FILL = 6, OP_URGENT_BORDER = 7, OP_REISSUE_BARS = 8, OP_CROSS = 9, OP_PROGRESS_META = 10, OP_SCHEDULE_PROGRESS_META = 11, OP_DOTTED_RECT = 12, OP_URGENT_TAB = 13 };
-enum FontType : uint8_t { FONT_MONO = 0, FONT_BOLD = 1 };
+enum OpType : uint8_t { OP_CLEAR = 0, OP_RECT = 1, OP_FILL_RECT = 2, OP_LINE = 3, OP_TEXT = 4, OP_BAR_OUTLINE = 5, OP_BAR_FILL = 6, OP_URGENT_BORDER = 7, OP_REISSUE_BARS = 8, OP_CROSS = 9, OP_PROGRESS_META = 10, OP_SCHEDULE_PROGRESS_META = 11, OP_DOTTED_RECT = 12, OP_URGENT_TAB = 13, OP_DOTTED_LINE = 14 };
+enum FontType : uint8_t { FONT_MONO = 0, FONT_BOLD = 1, FONT_SMALL = 2 };
 enum ColorType : uint8_t { COLOR_BLACK = 0, COLOR_RED = 1, COLOR_WHITE = 2 };
 
 struct RenderOp {
@@ -313,7 +313,7 @@ bool fetchRenderJobNow(unsigned long jobId) {
     ro.x = op["x"] | 0; ro.y = op["y"] | 0; ro.x2 = op["x1"] | op["x2"] | 0; ro.y2 = op["y1"] | op["y2"] | 0;
     ro.w = op["w"] | 0; ro.h = op["h"] | 0; ro.value = op["count"] | 0;
     String color = op["color"] | "black"; ro.color = (color == "red") ? COLOR_RED : ((color == "white") ? COLOR_WHITE : COLOR_BLACK);
-    String font = op["font"] | "mono"; ro.font = (font == "bold") ? FONT_BOLD : FONT_MONO;
+    String font = op["font"] | "mono"; ro.font = (font == "bold") ? FONT_BOLD : ((font == "small") ? FONT_SMALL : FONT_MONO);
     const char* textVal = op["text"] | ""; strlcpy(ro.text, textVal, sizeof(ro.text));
     if (opName == "clear") ro.type = OP_CLEAR;
     else if (opName == "rect") ro.type = OP_RECT;
@@ -327,6 +327,7 @@ bool fetchRenderJobNow(unsigned long jobId) {
     else if (opName == "cross") ro.type = OP_CROSS;
     else if (opName == "dotted_rect") ro.type = OP_DOTTED_RECT;
     else if (opName == "urgent_tab") ro.type = OP_URGENT_TAB;
+    else if (opName == "dotted_line") { ro.type = OP_DOTTED_LINE; ro.x = op["x1"] | 0; ro.y = op["y1"] | 0; ro.x2 = op["x2"] | 0; ro.y2 = op["y2"] | 0; }
     else continue;
     renderOpCount++;
   }
@@ -394,6 +395,7 @@ uint16_t mapColor(uint8_t colorCode) {
 
 void applyFont(uint8_t fontCode) {
   if (fontCode == FONT_BOLD) display.setFont(&FreeMonoBold9pt7b);
+  else if (fontCode == FONT_SMALL) display.setFont(NULL); // built-in compact 5x7 font
   else display.setFont(&FreeMono9pt7b);
 }
 
@@ -430,7 +432,8 @@ void drawDottedRectOp(const RenderOp &ro) {
 void drawUrgentTabOp(const RenderOp &ro) {
   uint16_t c = mapColor(ro.color);
   int size = ro.value > 0 ? ro.value : 14;
-  for (int i = 0; i < size; i += 2) {
+  if (size < 8) size = 8;
+  for (int i = 0; i < size; i++) {
     display.drawLine(ro.x + ro.w - size + i, ro.y + i, ro.x + ro.w, ro.y + i, c);
   }
 }
@@ -463,6 +466,9 @@ void executeRenderOpsOnce() {
         break;
       case OP_URGENT_TAB:
         drawUrgentTabOp(ro);
+        break;
+      case OP_DOTTED_LINE:
+        drawDottedLine(ro.x, ro.y, ro.x2, ro.y2, mapColor(ro.color));
         break;
       default: break;
     }
