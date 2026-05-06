@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Preferences.h>
 #include <SPI.h>
 #include <ESPmDNS.h>
 #include <HTTPClient.h>
@@ -10,7 +11,7 @@
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
-#define BUILD_VERSION "DEVICE_B_STABLE_CORE_MODERN_RENDER_V1_NO_OTA"
+#define BUILD_VERSION "DEVICE_B_STABLE_CORE_MODERN_RENDER_V2_DISPLAY_LOCKOUT_NO_OTA"
 
 #define CS 10
 #define DC 9
@@ -24,7 +25,7 @@ GxEPD2_3C<GxEPD2_750c_Z08, GxEPD2_750c_Z08::HEIGHT> display(
 );
 
 WebServer server(80);
-
+Preferences prefs;
 const char* fallbackApSSID = "TaskDevice";
 const char* fallbackApPassword = "tasks123";
 bool usingFallbackAP = false;
@@ -40,9 +41,8 @@ struct SavedNetwork {
   const char* ssid;
   const char* password;
 };
-
 SavedNetwork preferredNetworks[] = {
-  {"ASUS", "le0pardess"},
+  {"VM6269662", "FollyDaRabbit123"},
   {"guest-dog", "givemeinternet"},
   {"Tomspot", "Tom00001"}
 };
@@ -52,58 +52,16 @@ unsigned long lastMetaPoll = 0;
 const unsigned long metaPollInterval = 30000UL;
 unsigned long lastTimeSync = 0;
 const unsigned long timeSyncInterval = 21600000UL;
-unsigned long lastWifiRetry = 0;
-const unsigned long wifiRetryInterval = 60000UL;
-unsigned long lastTimedMainRefresh = 0;
-const unsigned long timedMainRefreshInterval = 300000UL;
-
 bool refreshInProgress = false;
 bool renderJobQueued = false;
 unsigned long targetJobId = 0;
 unsigned long lastAckedJobId = 0;
 bool timeSynced = false;
 
-String currentPageType = "main";
-
-String lastFaultStage = "none";
-String lastFaultDetail = "";
-int lastHttpCode = 0;
-String lastHttpUrl = "";
-unsigned long lastSuccessfulMetaMillis = 0;
-unsigned long lastSuccessfulJobMillis = 0;
-unsigned long lastSuccessfulAckMillis = 0;
-unsigned long lastRenderMillis = 0;
-int opsDropped = 0;
-
-struct RelayMeta {
-  unsigned long pageRevision;
-  String pageType;
-  unsigned long jobId;
-  unsigned long refreshRequested;
-  unsigned long forceOTA;
-  String firmwareVersionFromRelay;
-};
-RelayMeta latestMeta;
-
 enum DeviceState { STATE_IDLE, STATE_POLL_META, STATE_FETCH_JOB, STATE_RENDER_JOB, STATE_ACK_JOB, STATE_COOLDOWN };
 DeviceState deviceState = STATE_IDLE;
 
-enum OpType : uint8_t {
-  OP_CLEAR = 0,
-  OP_RECT = 1,
-  OP_FILL_RECT = 2,
-  OP_LINE = 3,
-  OP_TEXT = 4,
-  OP_BAR_OUTLINE = 5,
-  OP_BAR_FILL = 6,
-  OP_URGENT_BORDER = 7,
-  OP_REISSUE_BARS = 8,
-  OP_CROSS = 9,
-  OP_DOTTED_RECT = 10,
-  OP_URGENT_TAB = 11,
-  OP_DOTTED_LINE = 12
-};
-
+enum OpType : uint8_t { OP_CLEAR = 0, OP_RECT = 1, OP_FILL_RECT = 2, OP_LINE = 3, OP_TEXT = 4, OP_BAR_OUTLINE = 5, OP_BAR_FILL = 6, OP_URGENT_BORDER = 7, OP_REISSUE_BARS = 8, OP_CROSS = 9, OP_PROGRESS_META = 10, OP_SCHEDULE_PROGRESS_META = 11, OP_DOTTED_RECT = 12, OP_URGENT_TAB = 13, OP_DOTTED_LINE = 14 };
 enum FontType : uint8_t { FONT_MONO = 0, FONT_BOLD = 1 };
 enum ColorType : uint8_t { COLOR_BLACK = 0, COLOR_RED = 1, COLOR_WHITE = 2 };
 
@@ -124,59 +82,124 @@ struct RenderOp {
 const int MAX_OPS = 420;
 RenderOp renderOps[MAX_OPS];
 int renderOpCount = 0;
+String currentPageType = "main";
+
+// Lightweight diagnostics: kept simple to avoid changing the proven HTTP path.
+String lastFaultStage = "none";
+String lastFaultDetail = "";
+int lastHttpCode = 0;
+String lastHttpUrl = "";
+unsigned long lastHttpMillis = 0;
+unsigned long lastSuccessfulMetaMillis = 0;
+unsigned long lastSuccessfulJobMillis = 0;
+unsigned long lastSuccessfulAckMillis = 0;
+unsigned long lastRenderMillis = 0;
+int opsDropped = 0;
+unsigned long lastWifiRetry = 0;
+const unsigned long wifiRetryInterval = 60000UL;
+
+struct ProgressRegion {
+  uint8_t kind; // 0 task epoch, 1 schedule minutes
+  int16_t x, y, w, h;
+  uint32_t a;
+  uint32_t b;
+};
+
+const int MAX_PROGRESS_REGIONS = 16;
+ProgressRegion progressRegions[MAX_PROGRESS_REGIONS];
+int progressRegionCount = 0;
+unsigned long lastTimedMainRefresh = 0;
+const unsigned long timedMainRefreshInterval = 300000UL; // 5 min
+
+// Display/network isolation. Device B favours slow-safe behaviour over responsiveness.
+bool displayBusyPhase = false;
+unsigned long displayQuietUntil = 0;
+const unsigned long displaySettleMs = 10000UL;
+const unsigned long displayPowerSettleMs = 250UL;
+const unsigned long displayBusyTimeoutMs = 60000UL;
+
+
+struct RelayMeta {
+  unsigned long pageRevision;
+  String pageType;
+  unsigned long jobId;
+  unsigned long refreshRequested;
+  unsigned long forceOTA;
+  String firmwareVersionFromRelay;
+};
+RelayMeta latestMeta;
+
+bool tryConnectOneNetwork(const char* ssid, const char* password, unsigned long timeoutMs);
+void stopMDNS();
+void startFallbackAP();
+void connectPreferredOrFallback();
+void syncTimeNow();
+bool httpGET(String url, String &out);
+bool httpPOSTempty(String url);
+bool fetchRelayMetaNow(RelayMeta &meta);
+bool fetchRenderJobNow(unsigned long jobId);
+bool ackCurrentJob(unsigned long jobId);
+void runStateMachine();
+void handleButtonRefresh();
+void updateBootStatusScreen(const String &line1, const String &line2 = "");
+void updateDisplayFromRenderOps();
+void renderCurrentOpsPaged();
+uint16_t mapColor(uint8_t colorCode);
+float progressFraction(const ProgressRegion &r);
+void drawDynamicProgressFillsOnce();
+void drawDottedLine(int x1, int y1, int x2, int y2, uint16_t color, int dash = 4, int gap = 4);
+void drawDottedRect(const RenderOp &ro);
+void drawUrgentTab(const RenderOp &ro);
+void reconnectPreferredIfNeeded(bool force = false);
+void setFault(const String &stage, const String &detail);
 
 void setFault(const String &stage, const String &detail) {
   lastFaultStage = stage;
   lastFaultDetail = detail;
-  Serial.print("FAULT ");
-  Serial.print(stage);
-  Serial.print(": ");
-  Serial.println(detail);
+  Serial.print("FAULT "); Serial.print(stage); Serial.print(": "); Serial.println(detail);
 }
 
-uint16_t mapColor(uint8_t colorCode) {
-  if (colorCode == COLOR_RED) return GxEPD_RED;
-  if (colorCode == COLOR_WHITE) return GxEPD_WHITE;
-  return GxEPD_BLACK;
-}
-
-void applyFont(uint8_t fontCode) {
-  if (fontCode == FONT_BOLD) display.setFont(&FreeMonoBold9pt7b);
-  else display.setFont(&FreeMono9pt7b);
+bool safeForNetwork() {
+  if (refreshInProgress) return false;
+  if (displayBusyPhase) return false;
+  if (millis() < displayQuietUntil) return false;
+  if (usingFallbackAP) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  return true;
 }
 
 bool waitForDisplay() {
   unsigned long start = millis();
+
   while (digitalRead(BUSY) == HIGH) {
-    delay(1);
-    if (millis() - start > 15000) {
-      setFault("display", "BUSY_TIMEOUT");
+    delay(10);
+
+    if (millis() - start > displayBusyTimeoutMs) {
       Serial.println("Busy Timeout!");
-      display.end();
-      delay(500);
-      display.init();
+      setFault("display", "BUSY_TIMEOUT");
+      displayQuietUntil = millis() + displaySettleMs;
       return false;
     }
   }
+
   return true;
 }
 
 void displayWake() {
   pinMode(PWR_PIN, OUTPUT);
   digitalWrite(PWR_PIN, HIGH);
-  delay(80);
+  delay(displayPowerSettleMs);
 }
 
 void displaySleep() {
   display.hibernate();
-  delay(50);
+  delay(500);
   digitalWrite(PWR_PIN, LOW);
+  displayQuietUntil = millis() + displaySettleMs;
 }
 
 bool tryConnectOneNetwork(const char* ssid, const char* password, unsigned long timeoutMs) {
   if (ssid == nullptr || strlen(ssid) == 0) return false;
-  Serial.print("Trying WiFi: ");
-  Serial.println(ssid);
   WiFi.begin(ssid, password);
   unsigned long start = millis();
   while (millis() - start < timeoutMs) {
@@ -202,11 +225,9 @@ void startFallbackAP() {
   usingFallbackAP = true;
   activeNetworkName = "AP";
   activeAddress = WiFi.softAPIP().toString();
-  setFault("connection", "fallback_ap");
 }
 
 void connectPreferredOrFallback() {
-  stopMDNS();
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true);
   delay(300);
@@ -219,29 +240,22 @@ void connectPreferredOrFallback() {
         MDNS.addService("http", "tcp", 80);
         mdnsActive = true;
       }
-      setFault("none", "");
       return;
     }
   }
   startFallbackAP();
 }
 
-void reconnectPreferredIfNeeded(bool force = false) {
-  if (!force && (millis() - lastWifiRetry < wifiRetryInterval)) return;
-  if (!force && !usingFallbackAP && WiFi.status() == WL_CONNECTED) return;
-  lastWifiRetry = millis();
-  Serial.println("WiFi retry requested");
-  connectPreferredOrFallback();
-}
-
 void syncTimeNow() {
-  if (usingFallbackAP || WiFi.status() != WL_CONNECTED) {
+  if (usingFallbackAP) {
     timeSynced = false;
     return;
   }
+
   setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0/2", 1);
   tzset();
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
   struct tm timeinfo;
   for (int i = 0; i < 12; i++) {
     if (getLocalTime(&timeinfo)) {
@@ -256,15 +270,13 @@ void syncTimeNow() {
 
 bool httpGET(String url, String &out) {
   lastHttpUrl = url;
+  lastHttpMillis = millis();
   lastHttpCode = 0;
-  Serial.print("HTTP GET: ");
-  Serial.println(url);
-  if (usingFallbackAP) {
-    setFault("connection", "fallback_ap");
-    return false;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    setFault("connection", "wifi_not_connected");
+  Serial.print("HTTP GET: "); Serial.println(url);
+  if (!safeForNetwork()) {
+    if (usingFallbackAP) setFault("connection", "fallback_ap");
+    else if (WiFi.status() != WL_CONNECTED) setFault("connection", "wifi_not_connected");
+    else setFault("connection", "display_quiet");
     return false;
   }
 
@@ -275,10 +287,10 @@ bool httpGET(String url, String &out) {
     setFault("connection", "http_begin_failed");
     return false;
   }
+
   int code = http.GET();
   lastHttpCode = code;
-  Serial.print("HTTP CODE: ");
-  Serial.println(code);
+  Serial.print("HTTP CODE: "); Serial.println(code);
   if (code != 200) {
     setFault("connection", String("http_") + String(code));
     http.end();
@@ -293,33 +305,24 @@ bool httpGET(String url, String &out) {
 
 bool httpPOSTempty(String url) {
   lastHttpUrl = url;
+  lastHttpMillis = millis();
   lastHttpCode = 0;
-  Serial.print("HTTP POST: ");
-  Serial.println(url);
-  if (usingFallbackAP) {
-    setFault("connection", "fallback_ap");
-    return false;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    setFault("connection", "wifi_not_connected");
+  Serial.print("HTTP POST: "); Serial.println(url);
+  if (!safeForNetwork()) {
+    if (usingFallbackAP) setFault("connection", "fallback_ap");
+    else if (WiFi.status() != WL_CONNECTED) setFault("connection", "wifi_not_connected");
+    else setFault("connection", "display_quiet");
     return false;
   }
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  if (!http.begin(client, url)) {
-    setFault("connection", "http_begin_failed");
-    return false;
-  }
+  if (!http.begin(client, url)) { setFault("connection", "http_begin_failed"); return false; }
   int code = http.POST("");
   lastHttpCode = code;
-  Serial.print("HTTP POST CODE: ");
-  Serial.println(code);
+  Serial.print("HTTP POST CODE: "); Serial.println(code);
   http.end();
-  if (!(code >= 200 && code < 300)) {
-    setFault("connection", String("http_post_") + String(code));
-    return false;
-  }
+  if (!(code >= 200 && code < 300)) { setFault("connection", String("http_post_") + String(code)); return false; }
   return true;
 }
 
@@ -329,10 +332,7 @@ bool fetchRelayMetaNow(RelayMeta &meta) {
   if (!httpGET(url, payload)) return false;
   DynamicJsonDocument doc(2048);
   DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    setFault("json", String("meta_") + err.c_str());
-    return false;
-  }
+  if (err) { setFault("json", String("meta_") + err.c_str()); return false; }
   meta.pageRevision = doc["page_revision"] | 0;
   meta.pageType = doc["page_type"] | "main";
   meta.jobId = doc["job_id"] | 0;
@@ -343,63 +343,53 @@ bool fetchRelayMetaNow(RelayMeta &meta) {
   return true;
 }
 
-void loadCommonOpFields(RenderOp &ro, JsonObject op) {
-  ro.x = op["x"] | 0;
-  ro.y = op["y"] | 0;
-  ro.x2 = op["x2"] | 0;
-  ro.y2 = op["y2"] | 0;
-  ro.w = op["w"] | 0;
-  ro.h = op["h"] | 0;
-  ro.value = op["count"] | 0;
-  String color = op["color"] | "black";
-  ro.color = (color == "red") ? COLOR_RED : ((color == "white") ? COLOR_WHITE : COLOR_BLACK);
-  String font = op["font"] | "mono";
-  ro.font = (font == "bold") ? FONT_BOLD : FONT_MONO;
-  const char* textVal = op["text"] | "";
-  strlcpy(ro.text, textVal, sizeof(ro.text));
-}
-
 bool fetchRenderJobNow(unsigned long jobId) {
   String payload;
   String url = String(relayBaseUrl) + "/api/render_job?token=" + relayToken + "&job_id=" + String(jobId);
   if (!httpGET(url, payload)) return false;
-
   DynamicJsonDocument doc(65536);
   DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    setFault("json", String("job_") + err.c_str());
-    return false;
-  }
-  if (!(doc["ok"] | false)) {
-    setFault("json", "job_not_ok");
-    return false;
-  }
-
+  if (err) { setFault("json", String("job_") + err.c_str()); return false; }
+  if (!(doc["ok"] | false)) { setFault("json", "job_not_ok"); return false; }
   currentPageType = doc["page_type"].as<String>();
   JsonArray ops = doc["payload"]["ops"].as<JsonArray>();
   renderOpCount = 0;
+  progressRegionCount = 0;
   opsDropped = 0;
-
   for (JsonObject op : ops) {
     String opName = op["op"] | "";
-    if (renderOpCount >= MAX_OPS) {
-      opsDropped++;
+
+    if (opName == "progress_meta") {
+      if (progressRegionCount < MAX_PROGRESS_REGIONS) {
+        ProgressRegion &pr = progressRegions[progressRegionCount++];
+        pr.kind = 0;
+        pr.x = op["x"] | 0; pr.y = op["y"] | 0; pr.w = op["w"] | 0; pr.h = op["h"] | 0;
+        pr.a = op["created"] | 0; pr.b = op["deadline"] | 0;
+      }
       continue;
     }
 
-    RenderOp &ro = renderOps[renderOpCount];
-    loadCommonOpFields(ro, op);
+    if (opName == "schedule_progress_meta") {
+      if (progressRegionCount < MAX_PROGRESS_REGIONS) {
+        ProgressRegion &pr = progressRegions[progressRegionCount++];
+        pr.kind = 1;
+        pr.x = op["x"] | 0; pr.y = op["y"] | 0; pr.w = op["w"] | 0; pr.h = op["h"] | 0;
+        pr.a = op["gap_start"] | 0; pr.b = op["gap_end"] | 0;
+      }
+      continue;
+    }
 
+    if (renderOpCount >= MAX_OPS) { opsDropped++; setFault("memory", "ops_overflow"); break; }
+    RenderOp &ro = renderOps[renderOpCount];
+    ro.x = op["x"] | 0; ro.y = op["y"] | 0; ro.x2 = op["x1"] | op["x2"] | 0; ro.y2 = op["y1"] | op["y2"] | 0;
+    ro.w = op["w"] | 0; ro.h = op["h"] | 0; ro.value = op["count"] | 0;
+    String color = op["color"] | "black"; ro.color = (color == "red") ? COLOR_RED : ((color == "white") ? COLOR_WHITE : COLOR_BLACK);
+    String font = op["font"] | "mono"; ro.font = (font == "bold") ? FONT_BOLD : FONT_MONO; // "small" is intentionally rendered as normal mono in this build.
+    const char* textVal = op["text"] | ""; strlcpy(ro.text, textVal, sizeof(ro.text));
     if (opName == "clear") ro.type = OP_CLEAR;
     else if (opName == "rect") ro.type = OP_RECT;
     else if (opName == "fill_rect") ro.type = OP_FILL_RECT;
-    else if (opName == "line") {
-      ro.type = OP_LINE;
-      ro.x = op["x1"] | 0;
-      ro.y = op["y1"] | 0;
-      ro.x2 = op["x2"] | 0;
-      ro.y2 = op["y2"] | 0;
-    }
+    else if (opName == "line") { ro.type = OP_LINE; ro.x = op["x1"] | 0; ro.y = op["y1"] | 0; ro.x2 = op["x2"] | 0; ro.y2 = op["y2"] | 0; }
     else if (opName == "text") ro.type = OP_TEXT;
     else if (opName == "bar_outline") ro.type = OP_BAR_OUTLINE;
     else if (opName == "bar_fill") ro.type = OP_BAR_FILL;
@@ -408,24 +398,11 @@ bool fetchRenderJobNow(unsigned long jobId) {
     else if (opName == "cross") ro.type = OP_CROSS;
     else if (opName == "dotted_rect") ro.type = OP_DOTTED_RECT;
     else if (opName == "urgent_tab") ro.type = OP_URGENT_TAB;
-    else if (opName == "dotted_line") {
-      ro.type = OP_DOTTED_LINE;
-      ro.x = op["x1"] | 0;
-      ro.y = op["y1"] | 0;
-      ro.x2 = op["x2"] | 0;
-      ro.y2 = op["y2"] | 0;
-    }
-    else {
-      // Unknown ops are ignored safely so relay and firmware can evolve independently.
-      continue;
-    }
+    else if (opName == "dotted_line") { ro.type = OP_DOTTED_LINE; ro.x = op["x1"] | 0; ro.y = op["y1"] | 0; ro.x2 = op["x2"] | 0; ro.y2 = op["y2"] | 0; }
+    else { opsDropped++; continue; }
     renderOpCount++;
   }
-
-  if (opsDropped > 0) setFault("render", String("ops_dropped_") + String(opsDropped));
   lastSuccessfulJobMillis = millis();
-  Serial.print("OPS LOADED: ");
-  Serial.println(renderOpCount);
   return true;
 }
 
@@ -436,18 +413,30 @@ bool ackCurrentJob(unsigned long jobId) {
   return ok;
 }
 
-void drawDottedLine(int x1, int y1, int x2, int y2, uint16_t color, int dash = 4, int gap = 4) {
+uint16_t mapColor(uint8_t colorCode) {
+  if (colorCode == COLOR_RED) return GxEPD_RED;
+  if (colorCode == COLOR_WHITE) return GxEPD_WHITE;
+  return GxEPD_BLACK;
+}
+
+void applyFont(uint8_t fontCode) {
+  if (fontCode == FONT_BOLD) display.setFont(&FreeMonoBold9pt7b);
+  else display.setFont(&FreeMono9pt7b);
+}
+
+
+void drawDottedLine(int x1, int y1, int x2, int y2, uint16_t color, int dash, int gap) {
   if (x1 == x2) {
     int yStart = min(y1, y2);
     int yEnd = max(y1, y2);
-    for (int y = yStart; y < yEnd; y += dash + gap) {
-      display.drawLine(x1, y, x1, min(y + dash, yEnd), color);
+    for (int y = yStart; y <= yEnd; y += dash + gap) {
+      display.drawLine(x1, y, x2, min(y + dash, yEnd), color);
     }
   } else if (y1 == y2) {
     int xStart = min(x1, x2);
     int xEnd = max(x1, x2);
-    for (int x = xStart; x < xEnd; x += dash + gap) {
-      display.drawLine(x, y1, min(x + dash, xEnd), y1, color);
+    for (int x = xStart; x <= xEnd; x += dash + gap) {
+      display.drawLine(x, y1, min(x + dash, xEnd), y2, color);
     }
   } else {
     display.drawLine(x1, y1, x2, y2, color);
@@ -463,56 +452,32 @@ void drawDottedRect(const RenderOp &ro) {
 }
 
 void drawUrgentTab(const RenderOp &ro) {
-  int x = ro.x;
-  int y = ro.y;
-  int s = ro.value > 0 ? ro.value : 10;
+  int s = ro.value > 0 ? ro.value : min(ro.w, ro.h);
+  if (s <= 0) s = 10;
   uint16_t c = mapColor(ro.color);
-  display.fillTriangle(x, y, x - s, y, x, y + s, c);
+  // Filled right-angle triangle in top-right corner. Draw scan lines for broad GxEPD2 compatibility.
+  for (int i = 0; i < s; i++) {
+    display.drawLine(ro.x + ro.w - i, ro.y, ro.x + ro.w, ro.y + i, c);
+  }
 }
 
 void executeRenderOpsOnce() {
   for (int i = 0; i < renderOpCount; i++) {
     RenderOp &ro = renderOps[i];
     switch (ro.type) {
-      case OP_CLEAR:
-        display.fillScreen(mapColor(ro.color));
-        break;
-      case OP_RECT:
-        display.drawRect(ro.x, ro.y, ro.w, ro.h, mapColor(ro.color));
-        break;
-      case OP_FILL_RECT:
-        display.fillRect(ro.x, ro.y, ro.w, ro.h, mapColor(ro.color));
-        break;
-      case OP_LINE:
-        display.drawLine(ro.x, ro.y, ro.x2, ro.y2, mapColor(ro.color));
-        break;
+      case OP_CLEAR: display.fillScreen(mapColor(ro.color)); break;
+      case OP_RECT: display.drawRect(ro.x, ro.y, ro.w, ro.h, mapColor(ro.color)); break;
+      case OP_FILL_RECT: display.fillRect(ro.x, ro.y, ro.w, ro.h, mapColor(ro.color)); break;
+      case OP_LINE: display.drawLine(ro.x, ro.y, ro.x2, ro.y2, mapColor(ro.color)); break;
       case OP_TEXT:
-        applyFont(ro.font);
-        display.setTextColor(mapColor(ro.color));
-        display.setCursor(ro.x, ro.y);
-        display.print(ro.text);
-        display.setTextColor(GxEPD_BLACK);
-        break;
-      case OP_BAR_OUTLINE:
-        display.drawRect(ro.x, ro.y, ro.w, ro.h, mapColor(ro.color));
-        break;
-      case OP_BAR_FILL:
-        if (ro.w > 0 && ro.h > 0) display.fillRect(ro.x, ro.y, ro.w, ro.h, mapColor(ro.color));
-        break;
+        applyFont(ro.font); display.setTextColor(mapColor(ro.color)); display.setCursor(ro.x, ro.y); display.print(ro.text); display.setTextColor(GxEPD_BLACK); break;
+      case OP_BAR_OUTLINE: display.drawRect(ro.x, ro.y, ro.w, ro.h, mapColor(ro.color)); break;
+      case OP_BAR_FILL: if (ro.w > 0 && ro.h > 0) display.fillRect(ro.x, ro.y, ro.w, ro.h, mapColor(ro.color)); break;
       case OP_URGENT_BORDER:
-        display.drawRect(ro.x, ro.y, ro.w, ro.h, GxEPD_RED);
-        display.drawRect(ro.x + 1, ro.y + 1, ro.w - 2, ro.h - 2, GxEPD_RED);
-        break;
+        display.drawRect(ro.x, ro.y, ro.w, ro.h, GxEPD_RED); display.drawRect(ro.x + 1, ro.y + 1, ro.w - 2, ro.h - 2, GxEPD_RED); break;
       case OP_REISSUE_BARS: {
-        int segments = 5;
-        int count = ro.value;
-        if (count > segments) count = segments;
-        if (count < 0) count = 0;
-        for (int s = 0; s < segments; s++) {
-          int sy = ro.y + (segments - s - 1) * 8;
-          if (s < count) display.fillRect(ro.x, sy, 6, 6, GxEPD_BLACK);
-          else display.drawRect(ro.x, sy, 6, 6, GxEPD_BLACK);
-        }
+        int segments = 5; int count = ro.value; if (count > segments) count = segments; if (count < 0) count = 0;
+        for (int s = 0; s < segments; s++) { int sy = ro.y + (segments - s - 1) * 8; if (s < count) display.fillRect(ro.x, sy, 6, 6, GxEPD_BLACK); else display.drawRect(ro.x, sy, 6, 6, GxEPD_BLACK); }
         break;
       }
       case OP_CROSS:
@@ -528,17 +493,10 @@ void executeRenderOpsOnce() {
       case OP_DOTTED_LINE:
         drawDottedLine(ro.x, ro.y, ro.x2, ro.y2, mapColor(ro.color));
         break;
-      default:
-        break;
+      default: break;
     }
     if ((i % 12) == 0) delay(1);
   }
-}
-
-void drawDynamicProgressFillsOnce() {
-  // Deliberately empty in this stable build.
-  // Dynamic/partial progress refresh experiments are removed.
-  // The relay should send static bar_fill and notch ops for full refresh only.
 }
 
 void renderCurrentOpsPaged() {
@@ -550,54 +508,95 @@ void renderCurrentOpsPaged() {
   } while (display.nextPage());
 }
 
+float progressFraction(const ProgressRegion &r) {
+  if (!timeSynced) return -1.0f;
+  if (r.kind == 0) {
+    if (r.b <= r.a) return 1.0f;
+    time_t nowT; time(&nowT);
+    float frac = (float)(nowT - (time_t)r.a) / (float)((time_t)r.b - (time_t)r.a);
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    return frac;
+  }
+  int gapStart = (int)r.a;
+  int gapEnd = (int)r.b;
+  if (gapEnd <= gapStart) return 1.0f;
+  time_t nowT; time(&nowT);
+  struct tm *tmNow = localtime(&nowT);
+  if (!tmNow) return -1.0f;
+  int nowMins = tmNow->tm_hour * 60 + tmNow->tm_min;
+  float frac = (float)(nowMins - gapStart) / (float)(gapEnd - gapStart);
+  if (frac < 0.0f) frac = 0.0f;
+  if (frac > 1.0f) frac = 1.0f;
+  return frac;
+}
+
+void drawDynamicProgressFillsOnce() {
+  if (currentPageType != "main") return;
+  if (progressRegionCount <= 0) return;
+  if (!timeSynced) return;
+
+  for (int i = 0; i < progressRegionCount; i++) {
+    const ProgressRegion &pr = progressRegions[i];
+    float frac = progressFraction(pr);
+    if (frac < 0.0f) continue;
+    int fill = (int)(frac * pr.w);
+    if (fill < 0) fill = 0;
+    if (fill > pr.w) fill = pr.w;
+    if (fill > 0) {
+      display.fillRect(pr.x, pr.y, fill, pr.h, GxEPD_BLACK);
+    }
+  }
+}
+
 void updateDisplayFromRenderOps() {
-  if (refreshInProgress) return;
+  if (refreshInProgress || displayBusyPhase) {
+    setFault("render", "refresh_already_active");
+    return;
+  }
+
   refreshInProgress = true;
+  displayBusyPhase = true;
+
   displayWake();
   display.init();
-  delay(100);
-  waitForDisplay();
+  delay(200);
+
+  if (!waitForDisplay()) {
+    displaySleep();
+    displayBusyPhase = false;
+    refreshInProgress = false;
+    return;
+  }
+
   renderCurrentOpsPaged();
   displaySleep();
+
   lastTimedMainRefresh = millis();
   lastRenderMillis = millis();
+
+  displayBusyPhase = false;
   refreshInProgress = false;
 }
 
-void updateBootStatusScreen(const String &line1, const String &line2 = "") {
+void updateBootStatusScreen(const String &line1, const String &line2) {
   refreshInProgress = true;
-  displayWake();
-  display.init();
-  delay(100);
-  waitForDisplay();
+  displayBusyPhase = true;
+  displayWake(); display.init(); delay(200); waitForDisplay();
   display.setFullWindow();
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
     display.setTextColor(GxEPD_BLACK);
     display.setFont(&FreeMonoBold9pt7b);
-    display.setCursor(20, 60);
-    display.print(line1);
+    display.setCursor(20, 60); display.print(line1);
     display.setFont(&FreeMono9pt7b);
-    if (line2.length() > 0) {
-      display.setCursor(20, 100);
-      display.print(line2);
-    }
-    display.setCursor(20, 150);
-    display.print("Mode: ");
-    display.print(usingFallbackAP ? "Fallback AP" : "Preferred WiFi");
-    display.setCursor(20, 180);
-    display.print("Addr: ");
-    display.print(activeAddress);
-    if (lastFaultStage != "none") {
-      display.setCursor(20, 220);
-      display.print("Fault: ");
-      display.print(lastFaultStage);
-      display.setCursor(20, 250);
-      display.print(lastFaultDetail);
-    }
+    if (line2.length() > 0) { display.setCursor(20, 100); display.print(line2); }
+    display.setCursor(20, 150); display.print("Mode: "); display.print(usingFallbackAP ? "Fallback AP" : "Preferred WiFi");
+    display.setCursor(20, 180); display.print("Addr: "); display.print(activeAddress);
   } while (display.nextPage());
   displaySleep();
+  displayBusyPhase = false;
   refreshInProgress = false;
 }
 
@@ -623,6 +622,9 @@ String localWebpage() {
   page += "<br>Current page: "; page += currentPageType;
   page += "<br>State: "; page += stateName();
   page += "<br>Refresh in progress: "; page += refreshInProgress ? "yes" : "no";
+  page += "<br>Display busy phase: "; page += displayBusyPhase ? "yes" : "no";
+  page += "<br>Display quiet ms left: ";
+  page += String(millis() < displayQuietUntil ? (displayQuietUntil - millis()) : 0);
   page += "<br>Queued: "; page += renderJobQueued ? "yes" : "no";
   page += "<br>Target job: "; page += String(targetJobId);
   page += "<br>Last acked job: "; page += String(lastAckedJobId);
@@ -636,10 +638,6 @@ String localWebpage() {
   page += "<br>Free PSRAM: "; page += String(ESP.getFreePsram());
   page += "<br>Ops loaded: "; page += String(renderOpCount);
   page += "<br>Ops dropped: "; page += String(opsDropped);
-  page += "<br>Last meta ms: "; page += String(lastSuccessfulMetaMillis);
-  page += "<br>Last job ms: "; page += String(lastSuccessfulJobMillis);
-  page += "<br>Last ack ms: "; page += String(lastSuccessfulAckMillis);
-  page += "<br>Last render ms: "; page += String(lastRenderMillis);
   page += "</p>";
   page += "<form action='/refresh'><input type='submit' value='Refresh Device'></form>";
   page += "<form action='/fetch_now'><input type='submit' value='Fetch Relay Now'></form>";
@@ -648,36 +646,54 @@ String localWebpage() {
   return page;
 }
 
-void handleRoot() {
-  server.send(200, "text/html", localWebpage());
-}
-
+void handleRoot() { server.send(200, "text/html", localWebpage()); }
 void handleRefresh() {
-  if (!refreshInProgress) {
+  if (refreshInProgress || displayBusyPhase || millis() < displayQuietUntil) {
+    renderJobQueued = true;
+  } else {
     if (targetJobId == 0) deviceState = STATE_POLL_META;
     else renderJobQueued = true;
   }
-  server.sendHeader("Location", "/");
-  server.send(303);
+  server.sendHeader("Location", "/"); server.send(303);
 }
+void handleFetchNow() { if (!refreshInProgress && !displayBusyPhase && millis() >= displayQuietUntil) deviceState = STATE_POLL_META; else renderJobQueued = true; server.sendHeader("Location", "/"); server.send(303); }
+void handleRetryWiFi() { reconnectPreferredIfNeeded(true); server.sendHeader("Location", "/"); server.send(303); }
 
-void handleFetchNow() {
-  if (!refreshInProgress) deviceState = STATE_POLL_META;
-  server.sendHeader("Location", "/");
-  server.send(303);
-}
 
-void handleRetryWiFi() {
-  reconnectPreferredIfNeeded(true);
-  server.sendHeader("Location", "/");
-  server.send(303);
+void reconnectPreferredIfNeeded(bool force) {
+  if (!force && (millis() - lastWifiRetry < wifiRetryInterval)) return;
+  lastWifiRetry = millis();
+  if (!force && !usingFallbackAP && WiFi.status() == WL_CONNECTED) return;
+
+  Serial.println("WIFI RETRY START");
+  stopMDNS();
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(300);
+  for (int i = 0; i < preferredNetworkCount; i++) {
+    if (tryConnectOneNetwork(preferredNetworks[i].ssid, preferredNetworks[i].password, 8000)) {
+      usingFallbackAP = false;
+      activeNetworkName = preferredNetworks[i].ssid;
+      activeAddress = WiFi.localIP().toString();
+      if (MDNS.begin("taskdevice")) {
+        MDNS.addService("http", "tcp", 80);
+        mdnsActive = true;
+      }
+      setFault("none", "");
+      Serial.print("WIFI RETRY OK: "); Serial.println(activeAddress);
+      syncTimeNow();
+      return;
+    }
+  }
+  setFault("connection", "wifi_retry_failed");
+  startFallbackAP();
 }
 
 void handleButtonRefresh() {
   static unsigned long lastButtonAction = 0;
   if (digitalRead(REFRESH_BUTTON) == LOW) {
     if (millis() - lastButtonAction > 1200) {
-      if (!refreshInProgress) renderJobQueued = true;
+      renderJobQueued = true;
       lastButtonAction = millis();
     }
   }
@@ -686,65 +702,30 @@ void handleButtonRefresh() {
 void runStateMachine() {
   switch (deviceState) {
     case STATE_IDLE:
-      if (millis() - lastMetaPoll > metaPollInterval) deviceState = STATE_POLL_META;
-      else if (renderJobQueued && targetJobId > 0 && !refreshInProgress) deviceState = STATE_FETCH_JOB;
+      if (safeForNetwork() && (millis() - lastMetaPoll > metaPollInterval)) deviceState = STATE_POLL_META;
+      else if (safeForNetwork() && renderJobQueued && targetJobId > 0) deviceState = STATE_FETCH_JOB;
       break;
-
     case STATE_POLL_META:
       if (fetchRelayMetaNow(latestMeta)) {
         Serial.println("POLL META OK");
-        if (latestMeta.jobId > lastAckedJobId || latestMeta.refreshRequested) {
-          targetJobId = latestMeta.jobId;
-          renderJobQueued = true;
-        }
-        // OTA intentionally removed. force_ota is ignored.
-      } else {
-        Serial.println("POLL META FAIL");
-        if (lastFaultStage == "none") setFault("connection", "meta_fetch_failed");
-      }
-      lastMetaPoll = millis();
-      deviceState = STATE_IDLE;
-      break;
-
+        if (latestMeta.jobId > lastAckedJobId || latestMeta.refreshRequested) { targetJobId = latestMeta.jobId; renderJobQueued = true; }
+        // OTA intentionally removed in this stable-core branch. force_ota from relay is ignored.
+      } else { Serial.println("POLL META FAIL"); if (lastFaultStage == "none") setFault("connection", "meta_fetch_failed"); }
+      lastMetaPoll = millis(); deviceState = STATE_IDLE; break;
     case STATE_FETCH_JOB:
-      if (targetJobId > 0 && fetchRenderJobNow(targetJobId)) {
-        Serial.print("FETCH JOB OK: ");
-        Serial.println(targetJobId);
-        deviceState = STATE_RENDER_JOB;
-      } else {
-        Serial.println("FETCH JOB FAIL");
-        if (lastFaultStage == "none") setFault("fetch", "job_fetch_failed");
-        renderJobQueued = false;
-        deviceState = STATE_IDLE;
-      }
+      if (targetJobId > 0 && fetchRenderJobNow(targetJobId)) { Serial.print("FETCH JOB OK: "); Serial.println(targetJobId); deviceState = STATE_RENDER_JOB; }
+      else { Serial.println("FETCH JOB FAIL"); if (lastFaultStage == "none") setFault("fetch", "job_fetch_failed"); renderJobQueued = false; deviceState = STATE_IDLE; }
       break;
-
     case STATE_RENDER_JOB:
-      if (!refreshInProgress) {
-        updateDisplayFromRenderOps();
-        deviceState = STATE_ACK_JOB;
-      } else {
-        deviceState = STATE_IDLE;
-      }
+      if (!refreshInProgress) { updateDisplayFromRenderOps(); deviceState = STATE_ACK_JOB; }
+      else deviceState = STATE_IDLE;
       break;
-
     case STATE_ACK_JOB:
-      if (ackCurrentJob(targetJobId)) {
-        lastAckedJobId = targetJobId;
-        renderJobQueued = false;
-        Serial.print("ACK JOB OK: ");
-        Serial.println(targetJobId);
-      } else {
-        Serial.println("ACK JOB FAIL");
-        setFault("connection", "ack_failed");
-      }
-      deviceState = STATE_COOLDOWN;
-      break;
-
+      if (ackCurrentJob(targetJobId)) { lastAckedJobId = targetJobId; renderJobQueued = false; Serial.print("ACK JOB OK: "); Serial.println(targetJobId); }
+      else { Serial.println("ACK JOB FAIL"); setFault("connection", "ack_failed"); }
+      deviceState = STATE_COOLDOWN; break;
     case STATE_COOLDOWN:
-      delay(100);
-      deviceState = STATE_IDLE;
-      break;
+      delay(100); deviceState = STATE_IDLE; break;
   }
 }
 
@@ -752,44 +733,23 @@ void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("BOOT: DEVICE_B_STABLE_CORE_MODERN_RENDER_V1_NO_OTA");
-
-  pinMode(PWR_PIN, OUTPUT);
-  digitalWrite(PWR_PIN, LOW);
-  pinMode(REFRESH_BUTTON, INPUT_PULLUP);
-
+  Serial.println("BOOT: DEVICE_B_STABLE_CORE_MODERN_RENDER_V2_DISPLAY_LOCKOUT_NO_OTA");
+  pinMode(PWR_PIN, OUTPUT); digitalWrite(PWR_PIN, LOW); pinMode(REFRESH_BUTTON, INPUT_PULLUP);
   connectPreferredOrFallback();
   updateBootStatusScreen("Booting...", activeAddress);
-  Serial.print("WIFI MODE: ");
-  Serial.println(usingFallbackAP ? "Fallback AP" : "Preferred WiFi");
-  Serial.print("ADDRESS: ");
-  Serial.println(activeAddress);
-
+  Serial.print("WIFI MODE: "); Serial.println(usingFallbackAP ? "Fallback AP" : "Preferred WiFi");
+  Serial.print("ADDRESS: "); Serial.println(activeAddress);
   syncTimeNow();
-
-  server.on("/", handleRoot);
-  server.on("/refresh", handleRefresh);
-  server.on("/fetch_now", handleFetchNow);
-  server.on("/retry_wifi", handleRetryWiFi);
-  server.begin();
+  server.on("/", handleRoot); server.on("/refresh", handleRefresh); server.on("/fetch_now", handleFetchNow); server.on("/retry_wifi", handleRetryWiFi); server.begin();
   Serial.println("WEB SERVER STARTED");
-
   if (fetchRelayMetaNow(latestMeta)) {
     Serial.println("META OK");
     targetJobId = latestMeta.jobId;
     if (targetJobId > 0 && fetchRenderJobNow(targetJobId)) {
-      Serial.print("JOB FETCH OK: ");
-      Serial.println(targetJobId);
-      updateDisplayFromRenderOps();
-      ackCurrentJob(targetJobId);
-      lastAckedJobId = targetJobId;
-    } else {
-      updateBootStatusScreen("Relay online", "No job");
-    }
-  } else {
-    updateBootStatusScreen("Relay fetch fail", activeAddress);
-  }
-
+      Serial.print("JOB FETCH OK: "); Serial.println(targetJobId);
+      updateDisplayFromRenderOps(); ackCurrentJob(targetJobId); lastAckedJobId = targetJobId;
+    } else updateBootStatusScreen("Relay online", "No job");
+  } else updateBootStatusScreen("Relay fetch fail", activeAddress);
   lastMetaPoll = millis();
   lastTimedMainRefresh = millis();
   deviceState = STATE_IDLE;
@@ -802,12 +762,16 @@ void loop() {
     syncTimeNow();
   }
 
-  reconnectPreferredIfNeeded(false);
+  if (!refreshInProgress && !displayBusyPhase && millis() >= displayQuietUntil) {
+    reconnectPreferredIfNeeded(false);
+  }
   handleButtonRefresh();
   runStateMachine();
 
   if (currentPageType == "main" &&
       !refreshInProgress &&
+      !displayBusyPhase &&
+      millis() >= displayQuietUntil &&
       !renderJobQueued &&
       (millis() - lastTimedMainRefresh > timedMainRefreshInterval)) {
     Serial.println("TIMED MAIN FULL REFRESH");
