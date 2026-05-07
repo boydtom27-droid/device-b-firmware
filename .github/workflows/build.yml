@@ -39,7 +39,7 @@ jobs:
         run: |
           mkdir -p build
           arduino-cli compile \
-            --fqbn "esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB" \
+            --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi" \
             --output-dir build \
             .
 
