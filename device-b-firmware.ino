@@ -48,7 +48,7 @@ struct SavedNetwork {
   const char* password;
 };
 SavedNetwork preferredNetworks[] = {
-  {"ASUS", "le0pardess"},
+  {"VM6269662", "FollyDaRabbit123"},
   {"guest-dog", "givemeinternet"},
   {"Tomspot", "Tom00001"}
 };
