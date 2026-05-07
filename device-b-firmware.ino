@@ -11,7 +11,7 @@
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
-#define BUILD_VERSION "DEVICE_B_STABLE_CORE_MODERN_RENDER_V2_DISPLAY_LOCKOUT_NO_OTA"
+#define BUILD_VERSION "DEVICE_B_CLEAN_SCHEDULER_V1_NO_OTA"
 
 #define CS 10
 #define DC 9
@@ -35,14 +35,14 @@ bool mdnsActive = false;
 
 const char* relayBaseUrl = "https://device-b-relay.onrender.com";
 const char* relayToken = "abc123xyz789";
-const char* firmwareVersion = "stable_core_modern_render_v1";
+const char* firmwareVersion = "clean_scheduler_v1_no_ota";
 
 struct SavedNetwork {
   const char* ssid;
   const char* password;
 };
 SavedNetwork preferredNetworks[] = {
-  {"VM6269662", "FollyDaRabbit123"},
+  {"ASUS", "le0pardess"},
   {"guest-dog", "givemeinternet"},
   {"Tomspot", "Tom00001"}
 };
@@ -580,24 +580,16 @@ void updateDisplayFromRenderOps() {
 }
 
 void updateBootStatusScreen(const String &line1, const String &line2) {
-  refreshInProgress = true;
-  displayBusyPhase = true;
-  displayWake(); display.init(); delay(200); waitForDisplay();
-  display.setFullWindow();
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-    display.setTextColor(GxEPD_BLACK);
-    display.setFont(&FreeMonoBold9pt7b);
-    display.setCursor(20, 60); display.print(line1);
-    display.setFont(&FreeMono9pt7b);
-    if (line2.length() > 0) { display.setCursor(20, 100); display.print(line2); }
-    display.setCursor(20, 150); display.print("Mode: "); display.print(usingFallbackAP ? "Fallback AP" : "Preferred WiFi");
-    display.setCursor(20, 180); display.print("Addr: "); display.print(activeAddress);
-  } while (display.nextPage());
-  displaySleep();
-  displayBusyPhase = false;
-  refreshInProgress = false;
+  // Clean scheduler rule: routine faults are NOT drawn to the e-paper.
+  // Use serial/local web diagnostics instead. This prevents display faults
+  // from cascading into network/TLS failures during boot or retry loops.
+  Serial.print("STATUS: ");
+  Serial.print(line1);
+  if (line2.length() > 0) {
+    Serial.print(" | ");
+    Serial.print(line2);
+  }
+  Serial.println();
 }
 
 String stateName() {
@@ -656,7 +648,13 @@ void handleRefresh() {
   }
   server.sendHeader("Location", "/"); server.send(303);
 }
-void handleFetchNow() { if (!refreshInProgress && !displayBusyPhase && millis() >= displayQuietUntil) deviceState = STATE_POLL_META; else renderJobQueued = true; server.sendHeader("Location", "/"); server.send(303); }
+void handleFetchNow() {
+  if (!refreshInProgress && !displayBusyPhase && millis() >= displayQuietUntil) {
+    deviceState = STATE_POLL_META;
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
 void handleRetryWiFi() { reconnectPreferredIfNeeded(true); server.sendHeader("Location", "/"); server.send(303); }
 
 
@@ -702,30 +700,88 @@ void handleButtonRefresh() {
 void runStateMachine() {
   switch (deviceState) {
     case STATE_IDLE:
-      if (safeForNetwork() && (millis() - lastMetaPoll > metaPollInterval)) deviceState = STATE_POLL_META;
-      else if (safeForNetwork() && renderJobQueued && targetJobId > 0) deviceState = STATE_FETCH_JOB;
+      // Network manager: poll only when display is fully idle and post-display quiet period has expired.
+      if (safeForNetwork() && (millis() - lastMetaPoll > metaPollInterval)) {
+        deviceState = STATE_POLL_META;
+      }
+      else if (safeForNetwork() && renderJobQueued && targetJobId > 0) {
+        deviceState = STATE_FETCH_JOB;
+      }
       break;
+
     case STATE_POLL_META:
+      // Network phase only. No display calls here.
+      if (!safeForNetwork()) {
+        deviceState = STATE_IDLE;
+        break;
+      }
       if (fetchRelayMetaNow(latestMeta)) {
         Serial.println("POLL META OK");
-        if (latestMeta.jobId > lastAckedJobId || latestMeta.refreshRequested) { targetJobId = latestMeta.jobId; renderJobQueued = true; }
-        // OTA intentionally removed in this stable-core branch. force_ota from relay is ignored.
-      } else { Serial.println("POLL META FAIL"); if (lastFaultStage == "none") setFault("connection", "meta_fetch_failed"); }
-      lastMetaPoll = millis(); deviceState = STATE_IDLE; break;
+        if (latestMeta.jobId > lastAckedJobId || latestMeta.refreshRequested) {
+          targetJobId = latestMeta.jobId;
+          renderJobQueued = true;
+        }
+        // OTA intentionally removed. force_ota from relay is ignored.
+      } else {
+        Serial.println("POLL META FAIL");
+        if (lastFaultStage == "none") setFault("connection", "meta_fetch_failed");
+      }
+      lastMetaPoll = millis();
+      deviceState = STATE_IDLE;
+      break;
+
     case STATE_FETCH_JOB:
-      if (targetJobId > 0 && fetchRenderJobNow(targetJobId)) { Serial.print("FETCH JOB OK: "); Serial.println(targetJobId); deviceState = STATE_RENDER_JOB; }
-      else { Serial.println("FETCH JOB FAIL"); if (lastFaultStage == "none") setFault("fetch", "job_fetch_failed"); renderJobQueued = false; deviceState = STATE_IDLE; }
+      // Network phase only. A successful fetch populates the local render cache.
+      if (!safeForNetwork()) {
+        deviceState = STATE_IDLE;
+        break;
+      }
+      if (targetJobId > 0 && fetchRenderJobNow(targetJobId)) {
+        Serial.print("FETCH JOB OK: ");
+        Serial.println(targetJobId);
+        deviceState = STATE_RENDER_JOB;
+      } else {
+        Serial.println("FETCH JOB FAIL");
+        if (lastFaultStage == "none") setFault("fetch", "job_fetch_failed");
+        renderJobQueued = false;
+        deviceState = STATE_IDLE;
+      }
       break;
+
     case STATE_RENDER_JOB:
-      if (!refreshInProgress) { updateDisplayFromRenderOps(); deviceState = STATE_ACK_JOB; }
-      else deviceState = STATE_IDLE;
+      // Display phase only. No HTTP/JSON/WiFi calls inside updateDisplayFromRenderOps().
+      if (!refreshInProgress && !displayBusyPhase && renderOpCount > 0) {
+        updateDisplayFromRenderOps();
+        deviceState = STATE_ACK_JOB;
+      } else {
+        setFault("render", "no_ops_or_busy");
+        deviceState = STATE_IDLE;
+      }
       break;
+
     case STATE_ACK_JOB:
-      if (ackCurrentJob(targetJobId)) { lastAckedJobId = targetJobId; renderJobQueued = false; Serial.print("ACK JOB OK: "); Serial.println(targetJobId); }
-      else { Serial.println("ACK JOB FAIL"); setFault("connection", "ack_failed"); }
-      deviceState = STATE_COOLDOWN; break;
+      // Network phase after display quiet period. Do not fail ACK just because
+      // the e-paper has only just been powered down.
+      if (!safeForNetwork()) {
+        // Stay in ACK state until safe, but keep serving the local web page.
+        break;
+      }
+      if (ackCurrentJob(targetJobId)) {
+        lastAckedJobId = targetJobId;
+        renderJobQueued = false;
+        Serial.print("ACK JOB OK: ");
+        Serial.println(targetJobId);
+      } else {
+        Serial.println("ACK JOB FAIL");
+        setFault("connection", "ack_failed");
+      }
+      deviceState = STATE_COOLDOWN;
+      break;
+
     case STATE_COOLDOWN:
-      delay(100); deviceState = STATE_IDLE; break;
+      delay(100);
+      deviceState = STATE_IDLE;
+      break;
   }
 }
 
@@ -733,26 +789,52 @@ void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("BOOT: DEVICE_B_STABLE_CORE_MODERN_RENDER_V2_DISPLAY_LOCKOUT_NO_OTA");
-  pinMode(PWR_PIN, OUTPUT); digitalWrite(PWR_PIN, LOW); pinMode(REFRESH_BUTTON, INPUT_PULLUP);
+  Serial.println("BOOT: DEVICE_B_CLEAN_SCHEDULER_V1_NO_OTA");
+
+  pinMode(PWR_PIN, OUTPUT);
+  digitalWrite(PWR_PIN, LOW);
+  pinMode(REFRESH_BUTTON, INPUT_PULLUP);
+
+  // Local server is started regardless of relay success so diagnostics are available.
   connectPreferredOrFallback();
-  updateBootStatusScreen("Booting...", activeAddress);
-  Serial.print("WIFI MODE: "); Serial.println(usingFallbackAP ? "Fallback AP" : "Preferred WiFi");
-  Serial.print("ADDRESS: "); Serial.println(activeAddress);
-  syncTimeNow();
-  server.on("/", handleRoot); server.on("/refresh", handleRefresh); server.on("/fetch_now", handleFetchNow); server.on("/retry_wifi", handleRetryWiFi); server.begin();
+  Serial.print("WIFI MODE: ");
+  Serial.println(usingFallbackAP ? "Fallback AP" : "Preferred WiFi");
+  Serial.print("ADDRESS: ");
+  Serial.println(activeAddress);
+
+  server.on("/", handleRoot);
+  server.on("/refresh", handleRefresh);
+  server.on("/fetch_now", handleFetchNow);
+  server.on("/retry_wifi", handleRetryWiFi);
+  server.begin();
   Serial.println("WEB SERVER STARTED");
-  if (fetchRelayMetaNow(latestMeta)) {
+
+  if (!usingFallbackAP) {
+    syncTimeNow();
+  }
+
+  // Clean scheduler rule: do not draw boot/fault screens before networking.
+  // Fetch first; render only after a complete job has been cached.
+  if (safeForNetwork() && fetchRelayMetaNow(latestMeta)) {
     Serial.println("META OK");
     targetJobId = latestMeta.jobId;
     if (targetJobId > 0 && fetchRenderJobNow(targetJobId)) {
-      Serial.print("JOB FETCH OK: "); Serial.println(targetJobId);
-      updateDisplayFromRenderOps(); ackCurrentJob(targetJobId); lastAckedJobId = targetJobId;
-    } else updateBootStatusScreen("Relay online", "No job");
-  } else updateBootStatusScreen("Relay fetch fail", activeAddress);
+      Serial.print("JOB FETCH OK: ");
+      Serial.println(targetJobId);
+      deviceState = STATE_RENDER_JOB;
+      renderJobQueued = true;
+    } else {
+      Serial.println("BOOT JOB FETCH FAIL OR NO JOB");
+      deviceState = STATE_IDLE;
+    }
+  } else {
+    Serial.println("BOOT META FETCH SKIPPED/FAILED");
+    // Leave the previous e-paper image intact. Diagnostics are available via serial/local web.
+    deviceState = STATE_IDLE;
+  }
+
   lastMetaPoll = millis();
   lastTimedMainRefresh = millis();
-  deviceState = STATE_IDLE;
 }
 
 void loop() {
@@ -775,7 +857,7 @@ void loop() {
       !renderJobQueued &&
       (millis() - lastTimedMainRefresh > timedMainRefreshInterval)) {
     Serial.println("TIMED MAIN FULL REFRESH");
-    updateDisplayFromRenderOps();
+    if (renderOpCount > 0) updateDisplayFromRenderOps();
   }
 
   delay(1);
