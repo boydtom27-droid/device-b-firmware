@@ -31,11 +31,15 @@ jobs:
           arduino-cli lib install "ArduinoJson"
           arduino-cli lib install "GxEPD2"
 
+      - name: Show ESP32-S3 board options
+        run: |
+          arduino-cli board details -b esp32:esp32:esp32s3
+
       - name: Compile firmware
         run: |
           mkdir -p build
           arduino-cli compile \
-            --fqbn esp32:esp32:esp32s3 \
+            --fqbn "esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB" \
             --output-dir build \
             .
 
