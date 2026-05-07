@@ -268,11 +268,80 @@ void syncTimeNow() {
   timeSynced = false;
 }
 
+bool runNetworkPreflight(const String &host) {
+  Serial.println("=== NETWORK PREFLIGHT START ===");
+
+  Serial.print("WiFi.status: ");
+  Serial.println(WiFi.status());
+
+  Serial.print("SSID: ");
+  Serial.println(WiFi.SSID());
+
+  Serial.print("Local IP: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.print("Gateway: ");
+  Serial.println(WiFi.gatewayIP());
+
+  Serial.print("DNS1: ");
+  Serial.println(WiFi.dnsIP(0));
+
+  Serial.print("DNS2: ");
+  Serial.println(WiFi.dnsIP(1));
+
+  Serial.print("RSSI: ");
+  Serial.println(WiFi.RSSI());
+
+  IPAddress resolvedIP;
+
+  Serial.print("DNS lookup: ");
+  Serial.println(host);
+
+  bool dnsOk = WiFi.hostByName(host.c_str(), resolvedIP);
+
+  Serial.print("DNS OK: ");
+  Serial.println(dnsOk ? "YES" : "NO");
+
+  if (dnsOk) {
+    Serial.print("Resolved IP: ");
+    Serial.println(resolvedIP);
+  } else {
+    setFault("dns", "hostByName_failed");
+    Serial.println("=== NETWORK PREFLIGHT END ===");
+    return false;
+  }
+
+  WiFiClient tcp;
+
+  Serial.print("TCP connect to ");
+  Serial.print(host);
+  Serial.println(":443");
+
+  bool tcpOk = tcp.connect(host.c_str(), 443);
+
+  Serial.print("TCP OK: ");
+  Serial.println(tcpOk ? "YES" : "NO");
+
+  if (!tcpOk) {
+    setFault("tcp", "connect_443_failed");
+    Serial.println("=== NETWORK PREFLIGHT END ===");
+    return false;
+  }
+
+  tcp.stop();
+
+  Serial.println("=== NETWORK PREFLIGHT END ===");
+
+  return true;
+}
+
 bool httpGET(String url, String &out) {
   lastHttpUrl = url;
-  lastHttpMillis = millis();
   lastHttpCode = 0;
-  Serial.print("HTTP GET: "); Serial.println(url);
+
+  Serial.print("HTTP GET: ");
+  Serial.println(url);
+
   if (!safeForNetwork()) {
     if (usingFallbackAP) setFault("connection", "fallback_ap");
     else if (WiFi.status() != WL_CONNECTED) setFault("connection", "wifi_not_connected");
@@ -280,26 +349,56 @@ bool httpGET(String url, String &out) {
     return false;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  if (!http.begin(client, url)) {
-    setFault("connection", "http_begin_failed");
+  if (!runNetworkPreflight("device-b-relay.onrender.com")) {
     return false;
   }
 
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  Serial.println("TLS client configured");
+
+  HTTPClient http;
+
+  Serial.println("HTTP begin call...");
+
+  if (!http.begin(client, url)) {
+    setFault("connection", "http_begin_failed");
+    Serial.println("HTTP begin failed");
+    return false;
+  }
+
+  Serial.println("HTTP GET call...");
+
   int code = http.GET();
+
+  Serial.println("HTTP GET returned");
+
   lastHttpCode = code;
-  Serial.print("HTTP CODE: "); Serial.println(code);
+
+  Serial.print("HTTP CODE: ");
+  Serial.println(code);
+
   if (code != 200) {
     setFault("connection", String("http_") + String(code));
     http.end();
     return false;
   }
+
+  Serial.println("Reading payload...");
+
   out = http.getString();
+
+  Serial.print("Payload length: ");
+  Serial.println(out.length());
+
   http.end();
+
   lastFaultStage = "none";
   lastFaultDetail = "";
+
+  Serial.println("HTTP GET SUCCESS");
+
   return true;
 }
 
