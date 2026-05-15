@@ -12,7 +12,7 @@
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
-#define BUILD_VERSION "DEVICE_B_CLEAN_SCHEDULER_V7_SCRIBBLE_PANEL"
+#define BUILD_VERSION "DEVICE_B_CLEAN_SCHEDULER_V7_SCRIBBLE_BITMAP_NO_OTA"
 
 #define CS 10
 #define DC 9
@@ -67,7 +67,7 @@ bool timeSynced = false;
 enum DeviceState { STATE_IDLE, STATE_POLL_META, STATE_FETCH_JOB, STATE_RENDER_JOB, STATE_ACK_JOB, STATE_COOLDOWN };
 DeviceState deviceState = STATE_IDLE;
 
-enum OpType : uint8_t { OP_CLEAR = 0, OP_RECT = 1, OP_FILL_RECT = 2, OP_LINE = 3, OP_TEXT = 4, OP_BAR_OUTLINE = 5, OP_BAR_FILL = 6, OP_URGENT_BORDER = 7, OP_REISSUE_BARS = 8, OP_CROSS = 9, OP_PROGRESS_META = 10, OP_SCHEDULE_PROGRESS_META = 11, OP_DOTTED_RECT = 12, OP_URGENT_TAB = 13, OP_DOTTED_LINE = 14 };
+enum OpType : uint8_t { OP_CLEAR = 0, OP_RECT = 1, OP_FILL_RECT = 2, OP_LINE = 3, OP_TEXT = 4, OP_BAR_OUTLINE = 5, OP_BAR_FILL = 6, OP_URGENT_BORDER = 7, OP_REISSUE_BARS = 8, OP_CROSS = 9, OP_PROGRESS_META = 10, OP_SCHEDULE_PROGRESS_META = 11, OP_DOTTED_RECT = 12, OP_URGENT_TAB = 13, OP_DOTTED_LINE = 14, OP_BITMAP_REMOTE = 15 };
 enum FontType : uint8_t { FONT_MONO = 0, FONT_BOLD = 1, FONT_SMALL = 2 };
 enum ColorType : uint8_t { COLOR_BLACK = 0, COLOR_RED = 1, COLOR_WHITE = 2 };
 
@@ -89,6 +89,15 @@ const int MAX_OPS = 420;
 RenderOp renderOps[MAX_OPS];
 int renderOpCount = 0;
 String currentPageType = "main";
+
+const int SCRIBBLE_MAX_W = 320;
+const int SCRIBBLE_MAX_H = 480;
+const int SCRIBBLE_MAX_BYTES = ((SCRIBBLE_MAX_W * SCRIBBLE_MAX_H) + 7) / 8;
+uint8_t *scribbleBlack = nullptr;
+uint8_t *scribbleRed = nullptr;
+int scribbleW = 0;
+int scribbleH = 0;
+bool scribbleLoaded = false;
 
 // Lightweight diagnostics: kept simple to avoid changing the proven HTTP path.
 String lastFaultStage = "none";
@@ -141,6 +150,7 @@ void startFallbackAP();
 void connectPreferredOrFallback();
 void syncTimeNow();
 bool httpGET(String url, String &out);
+bool httpGETBinary(String url, uint8_t *buf, size_t maxLen, size_t &outLen);
 bool httpPOSTempty(String url);
 bool fetchRelayMetaNow(RelayMeta &meta);
 bool fetchRenderJobNow(unsigned long jobId);
@@ -373,6 +383,113 @@ bool httpsGETAttempt(String url, String &out) {
   return true;
 }
 
+
+bool httpsGETBinaryAttempt(String url, uint8_t *buf, size_t maxLen, size_t &outLen) {
+  outLen = 0;
+  WiFiClientSecure client;
+  configureSecureClient(client);
+  HTTPClient http;
+  http.setTimeout(30000);
+  http.setReuse(false);
+
+  Serial.println("HTTP binary begin call...");
+  if (!http.begin(client, url)) {
+    setFault("connection", "http_binary_begin_failed");
+    return false;
+  }
+  int code = http.GET();
+  lastHttpCode = code;
+  Serial.print("HTTP BINARY CODE: "); Serial.println(code);
+  if (code != 200) {
+    if (code < 0) { Serial.print("HTTP error text: "); Serial.println(http.errorToString(code)); }
+    setFault("connection", String("https_binary_") + String(code));
+    http.end();
+    return false;
+  }
+  int len = http.getSize();
+  Serial.print("HTTP BINARY SIZE: "); Serial.println(len);
+  if (len <= 0 || (size_t)len > maxLen) {
+    setFault("memory", String("binary_size_") + String(len));
+    http.end();
+    return false;
+  }
+  WiFiClient *stream = http.getStreamPtr();
+  size_t got = stream->readBytes(buf, len);
+  outLen = got;
+  http.end();
+  Serial.print("HTTP BINARY READ: "); Serial.println(got);
+  if (got != (size_t)len) {
+    setFault("connection", "binary_short_read");
+    return false;
+  }
+  lastFaultStage = "none";
+  lastFaultDetail = "";
+  return true;
+}
+
+bool httpGETBinary(String url, uint8_t *buf, size_t maxLen, size_t &outLen) {
+  lastHttpUrl = url;
+  lastHttpMillis = millis();
+  lastHttpCode = 0;
+  Serial.print("HTTPS BINARY GET: "); Serial.println(url);
+  if (!safeForNetwork()) {
+    if (usingFallbackAP) setFault("connection", "fallback_ap");
+    else if (WiFi.status() != WL_CONNECTED) setFault("connection", "wifi_not_connected");
+    else setFault("connection", "display_quiet");
+    return false;
+  }
+  printTlsContext();
+  if (!runHttpsPreflight("device-b-relay.onrender.com")) return false;
+  return httpsGETBinaryAttempt(url, buf, maxLen, outLen);
+}
+
+bool loadScribbleBitmap(uint32_t inkId, int targetW, int targetH) {
+  targetW = constrain(targetW, 1, SCRIBBLE_MAX_W);
+  targetH = constrain(targetH, 1, SCRIBBLE_MAX_H);
+  ensureScribbleBuffers();
+  if (!scribbleBlack || !scribbleRed) { setFault("memory", "scribble_buf_alloc"); return false; }
+  size_t maskBytes = ((size_t)targetW * (size_t)targetH + 7) / 8;
+  size_t maxLen = 8 + maskBytes * 2;
+  uint8_t *tmp = (uint8_t*)heap_caps_malloc(maxLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!tmp) tmp = (uint8_t*)malloc(maxLen);
+  if (!tmp) {
+    setFault("memory", "scribble_tmp_alloc");
+    return false;
+  }
+  size_t got = 0;
+  String url = String(relayBaseUrl) + "/api/scribble_bitmap?token=" + relayToken + "&id=" + String(inkId) + "&w=" + String(targetW) + "&h=" + String(targetH);
+  bool ok = httpGETBinary(url, tmp, maxLen, got);
+  if (!ok) { free(tmp); return false; }
+  if (got < 8 || tmp[0] != 'S' || tmp[1] != 'C' || tmp[2] != 'B' || tmp[3] != '1') {
+    free(tmp);
+    setFault("scribble", "bad_header");
+    return false;
+  }
+  int w = tmp[4] | (tmp[5] << 8);
+  int h = tmp[6] | (tmp[7] << 8);
+  if (w < 1 || h < 1 || w > SCRIBBLE_MAX_W || h > SCRIBBLE_MAX_H) {
+    free(tmp);
+    setFault("scribble", "bad_dims");
+    return false;
+  }
+  size_t bytes = ((size_t)w * (size_t)h + 7) / 8;
+  if (got != 8 + bytes * 2 || bytes > SCRIBBLE_MAX_BYTES) {
+    free(tmp);
+    setFault("scribble", "bad_size");
+    return false;
+  }
+  memset(scribbleBlack, 0, SCRIBBLE_MAX_BYTES);
+  memset(scribbleRed, 0, SCRIBBLE_MAX_BYTES);
+  memcpy(scribbleBlack, tmp + 8, bytes);
+  memcpy(scribbleRed, tmp + 8 + bytes, bytes);
+  scribbleW = w;
+  scribbleH = h;
+  scribbleLoaded = true;
+  free(tmp);
+  Serial.print("SCRIBBLE LOADED: "); Serial.print(w); Serial.print("x"); Serial.println(h);
+  return true;
+}
+
 bool httpGET(String url, String &out) {
   lastHttpUrl = url;
   lastHttpMillis = millis();
@@ -511,6 +628,11 @@ bool fetchRenderJobNow(unsigned long jobId) {
     else if (opName == "dotted_rect") ro.type = OP_DOTTED_RECT;
     else if (opName == "urgent_tab") ro.type = OP_URGENT_TAB;
     else if (opName == "dotted_line") { ro.type = OP_DOTTED_LINE; ro.x = op["x1"] | 0; ro.y = op["y1"] | 0; ro.x2 = op["x2"] | 0; ro.y2 = op["y2"] | 0; }
+    else if (opName == "bitmap_remote") {
+      ro.type = OP_BITMAP_REMOTE;
+      uint32_t inkId = op["id"] | 0;
+      if (inkId > 0) loadScribbleBitmap(inkId, ro.w, ro.h);
+    }
     else { opsDropped++; continue; }
     renderOpCount++;
   }
@@ -581,6 +703,45 @@ void drawUrgentTab(const RenderOp &ro) {
   }
 }
 
+
+void drawLoadedScribbleBitmap(int16_t x0, int16_t y0, int16_t w, int16_t h) {
+  if (!scribbleLoaded || scribbleW <= 0 || scribbleH <= 0) {
+    display.setFont();
+    display.setTextColor(GxEPD_BLACK);
+    display.setCursor(x0 + 8, y0 + 20);
+    display.print("scribble not loaded");
+    return;
+  }
+  int drawW = min((int)w, scribbleW);
+  int drawH = min((int)h, scribbleH);
+  int totalW = scribbleW;
+  for (int yy = 0; yy < drawH; yy++) {
+    int rowBase = yy * totalW;
+    for (int xxByte = 0; xxByte < (drawW + 7) / 8; xxByte++) {
+      int xx0 = xxByte * 8;
+      uint8_t bByte = 0;
+      uint8_t rByte = 0;
+      for (int bit = 0; bit < 8; bit++) {
+        int xx = xx0 + bit;
+        if (xx >= drawW) break;
+        int bitIndex = rowBase + xx;
+        uint8_t mask = (0x80 >> (bitIndex % 8));
+        size_t bi = bitIndex / 8;
+        if (scribbleBlack[bi] & mask) bByte |= (0x80 >> bit);
+        if (scribbleRed[bi] & mask) rByte |= (0x80 >> bit);
+      }
+      if (bByte == 0 && rByte == 0) continue;
+      for (int bit = 0; bit < 8; bit++) {
+        int xx = xx0 + bit;
+        if (xx >= drawW) break;
+        uint8_t bitMask = 0x80 >> bit;
+        if (rByte & bitMask) display.drawPixel(x0 + xx, y0 + yy, GxEPD_RED);
+        else if (bByte & bitMask) display.drawPixel(x0 + xx, y0 + yy, GxEPD_BLACK);
+      }
+    }
+  }
+}
+
 void executeRenderOpsOnce() {
   for (int i = 0; i < renderOpCount; i++) {
     RenderOp &ro = renderOps[i];
@@ -612,6 +773,9 @@ void executeRenderOpsOnce() {
         break;
       case OP_DOTTED_LINE:
         drawDottedLine(ro.x, ro.y, ro.x2, ro.y2, mapColor(ro.color));
+        break;
+      case OP_BITMAP_REMOTE:
+        drawLoadedScribbleBitmap(ro.x, ro.y, ro.w, ro.h);
         break;
       default: break;
     }
@@ -915,11 +1079,26 @@ void runStateMachine() {
   }
 }
 
+
+void ensureScribbleBuffers() {
+  if (!scribbleBlack) scribbleBlack = (uint8_t*)heap_caps_malloc(SCRIBBLE_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!scribbleRed) scribbleRed = (uint8_t*)heap_caps_malloc(SCRIBBLE_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!scribbleBlack) scribbleBlack = (uint8_t*)malloc(SCRIBBLE_MAX_BYTES);
+  if (!scribbleRed) scribbleRed = (uint8_t*)malloc(SCRIBBLE_MAX_BYTES);
+  if (scribbleBlack) memset(scribbleBlack, 0, SCRIBBLE_MAX_BYTES);
+  if (scribbleRed) memset(scribbleRed, 0, SCRIBBLE_MAX_BYTES);
+  Serial.print("Scribble buffers: ");
+  Serial.print(scribbleBlack ? "black OK" : "black FAIL");
+  Serial.print(" / ");
+  Serial.println(scribbleRed ? "red OK" : "red FAIL");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("BOOT: DEVICE_B_CLEAN_SCHEDULER_V3_HTTPS_PSRAM_DIAG_NO_OTA");
+  Serial.println("BOOT: DEVICE_B_CLEAN_SCHEDULER_V7_SCRIBBLE_BITMAP_NO_OTA");
+  ensureScribbleBuffers();
   printMemoryDiagnostics("boot");
 
   pinMode(PWR_PIN, OUTPUT);
