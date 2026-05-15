@@ -48,7 +48,7 @@ struct SavedNetwork {
   const char* password;
 };
 SavedNetwork preferredNetworks[] = {
-  {"ASUS", "le0pardess"},
+  {"VM6269662", "FollyDaRabbit123"},
   {"guest-dog", "givemeinternet"},
   {"Tomspot", "Tom00001"}
 };
@@ -414,17 +414,46 @@ bool httpsGETBinaryAttempt(String url, uint8_t *buf, size_t maxLen, size_t &outL
     return false;
   }
   WiFiClient *stream = http.getStreamPtr();
-  size_t got = stream->readBytes(buf, len);
-  outLen = got;
-  http.end();
-  Serial.print("HTTP BINARY READ: "); Serial.println(got);
-  if (got != (size_t)len) {
-    setFault("connection", "binary_short_read");
-    return false;
+
+size_t totalRead = 0;
+unsigned long lastProgressMs = millis();
+const unsigned long binaryReadTimeoutMs = 15000UL;
+
+while (totalRead < (size_t)contentLength) {
+  int availableNow = stream->available();
+
+  if (availableNow > 0) {
+    size_t remaining = (size_t)contentLength - totalRead;
+    size_t toRead = min((size_t)availableNow, remaining);
+
+    int n = stream->readBytes(buffer + totalRead, toRead);
+
+    if (n > 0) {
+      totalRead += (size_t)n;
+      lastProgressMs = millis();
+
+      Serial.print("HTTP BINARY READ PROGRESS: ");
+      Serial.print(totalRead);
+      Serial.print("/");
+      Serial.println(contentLength);
+    }
+  } else {
+    delay(5);
   }
-  lastFaultStage = "none";
-  lastFaultDetail = "";
-  return true;
+
+  if (millis() - lastProgressMs > binaryReadTimeoutMs) {
+    Serial.println("HTTP BINARY READ TIMEOUT");
+    break;
+  }
+}
+
+Serial.print("HTTP BINARY READ: ");
+Serial.println(totalRead);
+
+if (totalRead != (size_t)contentLength) {
+  setFault("connection", "binary_short_read");
+  http.end();
+  return false;
 }
 
 bool httpGETBinary(String url, uint8_t *buf, size_t maxLen, size_t &outLen) {
