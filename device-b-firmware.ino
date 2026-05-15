@@ -12,7 +12,7 @@
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
-#define BUILD_VERSION "DEVICE_B_CLEAN_SCHEDULER_V7_SCRIBBLE_BITMAP_NO_OTA"
+#define BUILD_VERSION "DEVICE_B_CLEAN_SCHEDULER_V8_SCRIBBLE_BINARY_READ_FIX_NO_OTA"
 
 #define CS 10
 #define DC 9
@@ -415,45 +415,60 @@ bool httpsGETBinaryAttempt(String url, uint8_t *buf, size_t maxLen, size_t &outL
   }
   WiFiClient *stream = http.getStreamPtr();
 
-size_t totalRead = 0;
-unsigned long lastProgressMs = millis();
-const unsigned long binaryReadTimeoutMs = 15000UL;
+  size_t totalRead = 0;
+  unsigned long lastProgressMs = millis();
+  const unsigned long binaryReadTimeoutMs = 15000UL;
 
-while (totalRead < (size_t)contentLength) {
-  int availableNow = stream->available();
+  while (totalRead < (size_t)len) {
+    int availableNow = stream->available();
 
-  if (availableNow > 0) {
-    size_t remaining = (size_t)contentLength - totalRead;
-    size_t toRead = min((size_t)availableNow, remaining);
+    if (availableNow > 0) {
+      size_t remaining = (size_t)len - totalRead;
+      size_t toRead = remaining;
 
-    int n = stream->readBytes(buffer + totalRead, toRead);
+      if (toRead > (size_t)availableNow) {
+        toRead = (size_t)availableNow;
+      }
 
-    if (n > 0) {
-      totalRead += (size_t)n;
-      lastProgressMs = millis();
+      // Keep each read modest; TLS streams can behave badly with huge reads.
+      if (toRead > 1024) {
+        toRead = 1024;
+      }
 
-      Serial.print("HTTP BINARY READ PROGRESS: ");
-      Serial.print(totalRead);
-      Serial.print("/");
-      Serial.println(contentLength);
+      size_t n = stream->readBytes(buf + totalRead, toRead);
+
+      if (n > 0) {
+        totalRead += n;
+        lastProgressMs = millis();
+
+        Serial.print("HTTP BINARY READ PROGRESS: ");
+        Serial.print(totalRead);
+        Serial.print("/");
+        Serial.println(len);
+      }
+    } else {
+      delay(5);
     }
-  } else {
-    delay(5);
+
+    if (millis() - lastProgressMs > binaryReadTimeoutMs) {
+      Serial.println("HTTP BINARY READ TIMEOUT");
+      break;
+    }
   }
 
-  if (millis() - lastProgressMs > binaryReadTimeoutMs) {
-    Serial.println("HTTP BINARY READ TIMEOUT");
-    break;
+  Serial.print("HTTP BINARY READ: "); Serial.println(totalRead);
+
+  if (totalRead != (size_t)len) {
+    setFault("connection", "binary_short_read");
+    http.end();
+    return false;
   }
-}
 
-Serial.print("HTTP BINARY READ: ");
-Serial.println(totalRead);
-
-if (totalRead != (size_t)contentLength) {
-  setFault("connection", "binary_short_read");
+  outLen = totalRead;
   http.end();
-  return false;
+  lastFaultStage = "none";
+  lastFaultDetail = "";
+  return true;
 }
 
 bool httpGETBinary(String url, uint8_t *buf, size_t maxLen, size_t &outLen) {
@@ -1126,7 +1141,7 @@ void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("BOOT: DEVICE_B_CLEAN_SCHEDULER_V7_SCRIBBLE_BITMAP_NO_OTA");
+  Serial.println("BOOT: DEVICE_B_CLEAN_SCHEDULER_V8_SCRIBBLE_BINARY_READ_FIX_NO_OTA");
   ensureScribbleBuffers();
   printMemoryDiagnostics("boot");
 
