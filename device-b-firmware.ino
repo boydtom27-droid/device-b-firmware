@@ -48,9 +48,9 @@ struct SavedNetwork {
   const char* password;
 };
 SavedNetwork preferredNetworks[] = {
+  {"Tomspot", "Tom00001"},
   {"VM6269662", "FollyDaRabbit123"},
   {"guest-dog", "givemeinternet"},
-  {"Tomspot", "Tom00001"}
 };
 const int preferredNetworkCount = sizeof(preferredNetworks) / sizeof(preferredNetworks[0]);
 
