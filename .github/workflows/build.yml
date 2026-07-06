@@ -11,18 +11,19 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Configure ESP32 board index
         run: |
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-          sudo mv bin/arduino-cli /usr/local/bin/arduino-cli
-          arduino-cli version
+          arduino-cli config init --overwrite
+          arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
 
       - name: Install ESP32 core
         run: |
-          arduino-cli config init --overwrite
-          arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
       - name: Install libraries
@@ -30,10 +31,11 @@ jobs:
           arduino-cli lib update-index
           arduino-cli lib install "ArduinoJson"
           arduino-cli lib install "GxEPD2"
+          arduino-cli lib install "Adafruit GFX Library"
 
       - name: Show ESP32-S3 board options
         run: |
-          arduino-cli board details -b esp32:esp32:esp32s3
+          arduino-cli board details -b esp32:esp32:esp32s3 || true
 
       - name: Compile firmware
         run: |
