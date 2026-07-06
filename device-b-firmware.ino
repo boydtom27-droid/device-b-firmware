@@ -1,42 +1,48 @@
 /*
-  Pocket E-paper pin + orientation test
-  Target: ESP32-S3 DevKit + Waveshare Pico-ePaper-4.2 400x300 B/W display
+  Pocket Device firmware - PD page-cache build
 
-  Purpose:
-    1) Confirms the selected SPI/control pins are functional.
-    2) Confirms the assumed landscape orientation:
-       DISPLAY LANDSCAPE, RIBBON/CABLE EDGE FACING THE USER.
+  Hardware target:
+    - ESP32-S3 Waveshare ESP32-S3-DEV-KIT-N8R8/N8RX style board
+    - Waveshare Pico-ePaper-4.2, 400x300, B/W with 4 grey-scale source payload
 
-  Wiring used by this test:
-    Display VCC  -> ESP32 3V3
-    Display GND  -> ESP32 GND
-    Display DIN  -> ESP32 GPIO11   // MOSI
-    Display SCK  -> ESP32 GPIO12   // SPI clock
-    Display CS   -> ESP32 GPIO10
-    Display DC   -> ESP32 GPIO9
-    Display RST  -> ESP32 GPIO8
-    Display BUSY -> ESP32 GPIO7
+  Wiring used by this build:
+    Display BUSY -> GPIO7
+    Display RST  -> GPIO8
+    Display DC   -> GPIO9
+    Display CS   -> GPIO10
+    Display DIN  -> GPIO11
+    Display SCK  -> GPIO12
+    Display GND  -> GND
+    Display VCC  -> 3V3
+    Button       -> GPIO14 to GND, INPUT_PULLUP
 
-  Optional buttons, not required for the display test:
-    BTN_NEXT -> GPIO14 to GND, INPUT_PULLUP
-    BTN_PREV -> GPIO13 to GND, INPUT_PULLUP
+  Relay endpoints used by this firmware:
+    /api/pd/meta
+    /api/pd/page?page=task|idea|calendar|scribble
+    /api/pd/ack
 
-  Display board setup:
-    BS selector should be set to 0 / 4-wire SPI.
-
-  If the display works but text is upside-down with the ribbon edge facing you,
-  change TEST_ROTATION from 0 to 2 and reflash.
-
-  If this does not compile because the panel class is unknown in your installed
-  GxEPD2 version, try one of the alternative class lines below.
+  Notes:
+    - The relay sends PGB1 binary pages: 400x300, 2 bits per pixel.
+    - This firmware stores the 2bpp greyscale pages in PSRAM and renders them
+      to the black/white panel using ordered spatial dithering. This preserves
+      the relay's greyscale intent even if the installed GxEPD2 driver does not
+      expose native 4-grey waveform drawing for this exact panel revision.
+    - If your GxEPD2 library does not contain GxEPD2_420_GDEY042T81, change the
+      EPD class below to GxEPD2_420 or GxEPD2_420_M01 and retest orientation.
 */
 
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
 #include <SPI.h>
+#include <time.h>
+#include <esp_heap_caps.h>
 #include <GxEPD2_BW.h>
-#include <Fonts/FreeMonoBold9pt7b.h>
-#include <Fonts/FreeMono9pt7b.h>
 
-// ---------------- Pin allocation ----------------
+#define BUILD_VERSION "PD_PAGE_CACHE_V1_PGB1_2BPP"
+
 #define EPD_BUSY 7
 #define EPD_RST  8
 #define EPD_DC   9
@@ -44,161 +50,519 @@
 #define EPD_MOSI 11
 #define EPD_SCK  12
 
-#define BTN_NEXT 14
-#define BTN_PREV 13
+#define BTN_PAGE 14
 
-// Set to 0 for the first test. If upside-down with ribbon/cable edge facing you, try 2.
-#define TEST_ROTATION 0
+#define DISPLAY_ROTATION 0
+#define PD_W 400
+#define PD_H 300
+#define PGB_HEADER_BYTES 10
+#define PGB_DATA_BYTES (((PD_W * PD_H * 2) + 7) / 8)
+#define PGB_TOTAL_BYTES (PGB_HEADER_BYTES + PGB_DATA_BYTES)
 
-// ---------------- Display driver selection ----------------
-// Most likely for newer Waveshare 4.2 inch B/W 400x300 modules.
+// Preferred display class for Waveshare 4.2" V2 style 400x300 black/white panel.
+// Alternatives if compilation fails: GxEPD2_420, GxEPD2_420_M01.
 GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> display(
   GxEPD2_420_GDEY042T81(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
 );
 
-// If the above class does not compile, comment it out and try ONE of these instead:
-// GxEPD2_BW<GxEPD2_420, GxEPD2_420::HEIGHT> display(GxEPD2_420(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
-// GxEPD2_BW<GxEPD2_420_GDEW042T2, GxEPD2_420_GDEW042T2::HEIGHT> display(GxEPD2_420_GDEW042T2(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
+WebServer server(80);
 
-void drawCornerLabel(int16_t x, int16_t y, const char* label) {
-  display.setFont(&FreeMonoBold9pt7b);
-  display.setTextColor(GxEPD_BLACK);
-  display.setCursor(x, y);
-  display.print(label);
+const char* relayBaseUrl = "https://device-b-relay.onrender.com";
+const char* relayToken = "abc123xyz789";
+
+struct SavedNetwork {
+  const char* ssid;
+  const char* password;
+};
+SavedNetwork preferredNetworks[] = {
+  {"Tomspot", "Tom00001"},
+  {"VM6269662", "FollyDaRabbit123"},
+  {"guest-dog", "givemeinternet"},
+};
+const int preferredNetworkCount = sizeof(preferredNetworks) / sizeof(preferredNetworks[0]);
+
+const char* pageKeys[] = {"task", "idea", "calendar", "scribble"};
+const char* pageTitles[] = {"Tasks", "Ideas", "Calendar", "Scribble"};
+const int pageCount = 4;
+
+struct CachedPage {
+  const char* key;
+  uint32_t revision;
+  bool loaded;
+  uint8_t* payload;   // PGB1 data body only, not header
+};
+CachedPage pages[4];
+
+int currentPage = 0;
+uint32_t bundleRevision = 0;
+uint32_t lastAckedBundleRevision = 0;
+unsigned long lastPollMs = 0;
+const unsigned long pollIntervalMs = 60000UL;
+
+bool usingFallbackAP = false;
+String activeNetworkName = "";
+String activeAddress = "";
+String lastFaultStage = "none";
+String lastFaultDetail = "";
+int lastHttpCode = 0;
+String lastHttpUrl = "";
+unsigned long lastRenderMs = 0;
+unsigned long lastMetaOkMs = 0;
+unsigned long lastPageOkMs = 0;
+unsigned long lastButtonChangeMs = 0;
+bool displayBusy = false;
+
+void setFault(const String& stage, const String& detail) {
+  lastFaultStage = stage;
+  lastFaultDetail = detail;
+  Serial.print("FAULT "); Serial.print(stage); Serial.print(": "); Serial.println(detail);
 }
 
-void drawArrowRight(int x, int y, int len) {
-  display.drawLine(x, y, x + len, y, GxEPD_BLACK);
-  display.drawLine(x + len, y, x + len - 8, y - 5, GxEPD_BLACK);
-  display.drawLine(x + len, y, x + len - 8, y + 5, GxEPD_BLACK);
+void allocatePageBuffers() {
+  for (int i = 0; i < pageCount; i++) {
+    pages[i].key = pageKeys[i];
+    pages[i].revision = 0;
+    pages[i].loaded = false;
+    pages[i].payload = (uint8_t*)heap_caps_malloc(PGB_DATA_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pages[i].payload) pages[i].payload = (uint8_t*)malloc(PGB_DATA_BYTES);
+    if (!pages[i].payload) {
+      setFault("memory", String("page_alloc_") + pageKeys[i]);
+    } else {
+      memset(pages[i].payload, 0xFF, PGB_DATA_BYTES);
+    }
+  }
 }
 
-void drawArrowDown(int x, int y, int len) {
-  display.drawLine(x, y, x, y + len, GxEPD_BLACK);
-  display.drawLine(x, y + len, x - 5, y + len - 8, GxEPD_BLACK);
-  display.drawLine(x, y + len, x + 5, y + len - 8, GxEPD_BLACK);
+bool tryConnectOneNetwork(const char* ssid, const char* password, unsigned long timeoutMs) {
+  if (!ssid || strlen(ssid) == 0) return false;
+  Serial.print("WiFi trying: "); Serial.println(ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    if (WiFi.status() == WL_CONNECTED) return true;
+    delay(250);
+  }
+  WiFi.disconnect(true, true);
+  delay(300);
+  return false;
 }
 
-void drawPinTable(int x, int y) {
-  display.setFont(NULL);
-  display.setTextColor(GxEPD_BLACK);
-
-  display.setCursor(x, y);      display.print("DISPLAY -> ESP32-S3");
-  display.setCursor(x, y + 14); display.print("BUSY -> GPIO7");
-  display.setCursor(x, y + 26); display.print("RST  -> GPIO8");
-  display.setCursor(x, y + 38); display.print("DC   -> GPIO9");
-  display.setCursor(x, y + 50); display.print("CS   -> GPIO10");
-  display.setCursor(x, y + 62); display.print("SCK  -> GPIO12");
-  display.setCursor(x, y + 74); display.print("DIN  -> GPIO11 MOSI");
-  display.setCursor(x, y + 86); display.print("VCC  -> 3V3, GND -> GND");
+void startFallbackAP() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("PocketDevice", "tasks123");
+  usingFallbackAP = true;
+  activeNetworkName = "Fallback AP";
+  activeAddress = WiFi.softAPIP().toString();
 }
 
-void drawButtonStatus(int x, int y) {
-  display.setFont(NULL);
-  display.setTextColor(GxEPD_BLACK);
-  display.setCursor(x, y);
-  display.print("BTN14=");
-  display.print(digitalRead(BTN_NEXT) == LOW ? "LOW/PRESSED" : "HIGH");
-  display.setCursor(x, y + 12);
-  display.print("BTN13=");
-  display.print(digitalRead(BTN_PREV) == LOW ? "LOW/PRESSED" : "HIGH");
+void connectPreferredOrFallback() {
+  usingFallbackAP = false;
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(300);
+  for (int i = 0; i < preferredNetworkCount; i++) {
+    if (tryConnectOneNetwork(preferredNetworks[i].ssid, preferredNetworks[i].password, 8000)) {
+      activeNetworkName = preferredNetworks[i].ssid;
+      activeAddress = WiFi.localIP().toString();
+      Serial.print("WiFi OK: "); Serial.println(activeAddress);
+      return;
+    }
+  }
+  setFault("wifi", "preferred_failed_fallback_ap");
+  startFallbackAP();
 }
 
-void drawOrientationPattern() {
-  int16_t w = display.width();
-  int16_t h = display.height();
+void syncTimeNow() {
+  if (usingFallbackAP || WiFi.status() != WL_CONNECTED) return;
+  setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0/2", 1);
+  tzset();
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  struct tm timeinfo;
+  for (int i = 0; i < 12; i++) {
+    if (getLocalTime(&timeinfo)) {
+      Serial.println("Time sync OK");
+      return;
+    }
+    delay(250);
+  }
+  setFault("time", "ntp_failed");
+}
 
-  display.fillScreen(GxEPD_WHITE);
+bool safeForNetwork() {
+  if (displayBusy) return false;
+  if (usingFallbackAP) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  return true;
+}
 
-  // Outer border and asymmetric internal frame make rotation/mirroring obvious.
-  display.drawRect(0, 0, w, h, GxEPD_BLACK);
-  display.drawRect(3, 3, w - 6, h - 6, GxEPD_BLACK);
-  display.fillRect(0, 0, 34, 34, GxEPD_BLACK);              // black block top-left
-  display.drawRect(w - 35, 1, 33, 33, GxEPD_BLACK);         // outlined block top-right
-  display.drawLine(0, h - 1, w - 1, 0, GxEPD_BLACK);        // diagonal
+bool configureSecureClient(WiFiClientSecure& client) {
+  client.setInsecure();
+  client.setHandshakeTimeout(30);
+  return true;
+}
 
-  // Corner labels.
-  drawCornerLabel(42, 24, "TL");
-  drawCornerLabel(w - 72, 24, "TR");
-  drawCornerLabel(12, h - 14, "BL");
-  drawCornerLabel(w - 72, h - 14, "BR");
+bool httpGETText(const String& url, String& out) {
+  out = "";
+  lastHttpUrl = url;
+  lastHttpCode = 0;
+  if (!safeForNetwork()) {
+    setFault("connection", usingFallbackAP ? "fallback_ap" : "wifi_or_display_busy");
+    return false;
+  }
+  WiFiClientSecure client;
+  configureSecureClient(client);
+  HTTPClient http;
+  http.setTimeout(25000);
+  http.setReuse(false);
+  if (!http.begin(client, url)) {
+    setFault("http", "begin_failed");
+    return false;
+  }
+  int code = http.GET();
+  lastHttpCode = code;
+  if (code != 200) {
+    setFault("http", String("GET_") + code);
+    http.end();
+    return false;
+  }
+  out = http.getString();
+  http.end();
+  lastFaultStage = "none";
+  lastFaultDetail = "";
+  return true;
+}
 
-  // Main title and orientation statement.
-  display.setFont(&FreeMonoBold9pt7b);
-  display.setTextColor(GxEPD_BLACK);
-  display.setCursor(60, 58);
-  display.print("POCKET E-PAPER TEST");
+bool httpGETBinaryToBuffer(const String& url, uint8_t* outBuf, size_t expectedLen, size_t& got) {
+  got = 0;
+  lastHttpUrl = url;
+  lastHttpCode = 0;
+  if (!safeForNetwork()) {
+    setFault("connection", usingFallbackAP ? "fallback_ap" : "wifi_or_display_busy");
+    return false;
+  }
+  WiFiClientSecure client;
+  configureSecureClient(client);
+  HTTPClient http;
+  http.setTimeout(35000);
+  http.setReuse(false);
+  if (!http.begin(client, url)) {
+    setFault("http", "binary_begin_failed");
+    return false;
+  }
+  int code = http.GET();
+  lastHttpCode = code;
+  if (code != 200) {
+    setFault("http", String("BIN_GET_") + code);
+    http.end();
+    return false;
+  }
+  int len = http.getSize();
+  if (len > 0 && (size_t)len != expectedLen) {
+    setFault("http", String("binary_size_") + len);
+    http.end();
+    return false;
+  }
+  WiFiClient* stream = http.getStreamPtr();
+  unsigned long lastProgress = millis();
+  while (got < expectedLen) {
+    int avail = stream->available();
+    if (avail > 0) {
+      size_t toRead = expectedLen - got;
+      if (toRead > (size_t)avail) toRead = (size_t)avail;
+      if (toRead > 1024) toRead = 1024;
+      size_t n = stream->readBytes(outBuf + got, toRead);
+      if (n > 0) {
+        got += n;
+        lastProgress = millis();
+      }
+    } else {
+      delay(5);
+    }
+    if (millis() - lastProgress > 15000UL) {
+      setFault("http", "binary_timeout");
+      http.end();
+      return false;
+    }
+  }
+  http.end();
+  lastFaultStage = "none";
+  lastFaultDetail = "";
+  return true;
+}
 
-  display.setFont(&FreeMono9pt7b);
-  display.setCursor(34, 88);
-  display.print("Landscape: ribbon/cable edge faces user");
+bool httpPOSTAck(uint32_t rev) {
+  if (!safeForNetwork()) return false;
+  String url = String(relayBaseUrl) + "/api/pd/ack?token=" + relayToken + "&bundle_revision=" + String(rev) + "&page=" + pageKeys[currentPage];
+  WiFiClientSecure client;
+  configureSecureClient(client);
+  HTTPClient http;
+  http.setTimeout(15000);
+  if (!http.begin(client, url)) return false;
+  int code = http.POST("");
+  http.end();
+  return code >= 200 && code < 300;
+}
 
-  // Direction indicators.
-  display.setFont(NULL);
-  display.setCursor(158, 10);
-  display.print("TOP / AWAY FROM USER");
-  display.setCursor(126, h - 22);
-  display.print("BOTTOM / RIBBON / TOWARDS USER");
+int pageIndexByKey(const char* key) {
+  for (int i = 0; i < pageCount; i++) {
+    if (strcmp(key, pageKeys[i]) == 0) return i;
+  }
+  return -1;
+}
 
-  drawArrowRight(34, 112, 105);
-  display.setCursor(150, 107);
-  display.print("X increases right");
+bool fetchOnePage(const char* key, uint32_t revision, bool force) {
+  int idx = pageIndexByKey(key);
+  if (idx < 0 || !pages[idx].payload) return false;
+  if (!force && pages[idx].loaded && pages[idx].revision == revision) return true;
 
-  drawArrowDown(34, 130, 62);
-  display.setCursor(48, 160);
-  display.print("Y increases down");
+  uint8_t* tmp = (uint8_t*)heap_caps_malloc(PGB_TOTAL_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!tmp) tmp = (uint8_t*)malloc(PGB_TOTAL_BYTES);
+  if (!tmp) {
+    setFault("memory", "tmp_pgb_alloc");
+    return false;
+  }
 
-  // A simple panel split matching the future pocket concept.
-  display.drawRect(214, 104, 166, 70, GxEPD_BLACK);
-  display.setCursor(224, 116); display.print("FULL-PAGE PANEL");
-  display.setCursor(224, 130); display.print("e.g. right panel");
-  display.setCursor(224, 144); display.print("or compact task view");
+  String url = String(relayBaseUrl) + "/api/pd/page?token=" + relayToken + "&page=" + key;
+  size_t got = 0;
+  bool ok = httpGETBinaryToBuffer(url, tmp, PGB_TOTAL_BYTES, got);
+  if (!ok) {
+    free(tmp);
+    return false;
+  }
+  if (got != PGB_TOTAL_BYTES || tmp[0] != 'P' || tmp[1] != 'G' || tmp[2] != 'B' || tmp[3] != '1') {
+    free(tmp);
+    setFault("pgb", "bad_header");
+    return false;
+  }
+  uint16_t w = tmp[4] | (tmp[5] << 8);
+  uint16_t h = tmp[6] | (tmp[7] << 8);
+  uint8_t bpp = tmp[8];
+  if (w != PD_W || h != PD_H || bpp != 2) {
+    free(tmp);
+    setFault("pgb", "bad_geometry");
+    return false;
+  }
+  memcpy(pages[idx].payload, tmp + PGB_HEADER_BYTES, PGB_DATA_BYTES);
+  free(tmp);
+  pages[idx].revision = revision;
+  pages[idx].loaded = true;
+  lastPageOkMs = millis();
+  Serial.print("Page loaded: "); Serial.print(key); Serial.print(" rev="); Serial.println(revision);
+  return true;
+}
 
-  display.drawRect(214, 184, 166, 42, GxEPD_BLACK);
-  display.setCursor(224, 198); display.print("Rotation = ");
-  display.print(TEST_ROTATION);
+bool fetchMetaAndChangedPages(bool force) {
+  String payload;
+  String url = String(relayBaseUrl) + "/api/pd/meta?token=" + relayToken;
+  if (!httpGETText(url, payload)) return false;
+  DynamicJsonDocument doc(8192);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    setFault("json", String("meta_") + err.c_str());
+    return false;
+  }
+  if (!(doc["ok"] | false)) {
+    setFault("json", "meta_not_ok");
+    return false;
+  }
+  bundleRevision = doc["bundle_revision"] | 0;
+  JsonArray arr = doc["pages"].as<JsonArray>();
+  bool allOk = true;
+  for (JsonObject p : arr) {
+    const char* key = p["key"] | "";
+    uint32_t rev = p["revision"] | 0;
+    if (!fetchOnePage(key, rev, force)) allOk = false;
+  }
+  lastMetaOkMs = millis();
+  if (allOk && bundleRevision != lastAckedBundleRevision) {
+    if (httpPOSTAck(bundleRevision)) lastAckedBundleRevision = bundleRevision;
+  }
+  return allOk;
+}
 
-  drawPinTable(12, 206);
-  drawButtonStatus(236, 236);
+uint8_t pgbLevelAt(const uint8_t* body, int x, int y) {
+  uint32_t i = (uint32_t)y * PD_W + x;
+  uint8_t packed = body[i / 4];
+  uint8_t shift = (3 - (i % 4)) * 2;
+  return (packed >> shift) & 0x03;
+}
 
-  display.setFont(NULL);
-  display.setCursor(236, 264);
-  display.print("If upside-down: set rotation 2");
-  display.setCursor(236, 278);
-  display.print("If no image: check BS=0 + pins");
+bool levelToBlack(uint8_t level, int x, int y) {
+  if (level == 0) return true;
+  if (level == 3) return false;
+  // Ordered 2x2 dither matrix. level 1 = dark grey, level 2 = light grey.
+  static const uint8_t threshold2x2[2][2] = {{0, 2}, {3, 1}};
+  uint8_t threshold = threshold2x2[y & 1][x & 1];
+  uint8_t blackCount = (level == 1) ? 3 : 1;
+  return threshold < blackCount;
+}
+
+void drawCurrentPageToDisplay(bool fullRefresh) {
+  if (currentPage < 0 || currentPage >= pageCount) currentPage = 0;
+  if (!pages[currentPage].loaded || !pages[currentPage].payload) {
+    showStatusScreen("PD page missing", pageTitles[currentPage]);
+    return;
+  }
+  displayBusy = true;
+  Serial.print("Render page: "); Serial.println(pageKeys[currentPage]);
+  display.init(115200, true, 2, false);
+  display.setRotation(DISPLAY_ROTATION);
+  if (fullRefresh) display.setFullWindow();
+  else display.setPartialWindow(0, 0, PD_W, PD_H);
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    const uint8_t* body = pages[currentPage].payload;
+    for (int y = 0; y < PD_H; y++) {
+      for (int x = 0; x < PD_W; x++) {
+        uint8_t level = pgbLevelAt(body, x, y);
+        if (levelToBlack(level, x, y)) {
+          display.drawPixel(x, y, GxEPD_BLACK);
+        }
+      }
+      if ((y % 10) == 0) delay(1);
+    }
+  } while (display.nextPage());
+  display.hibernate();
+  displayBusy = false;
+  lastRenderMs = millis();
+}
+
+void showStatusScreen(const String& line1, const String& line2) {
+  displayBusy = true;
+  display.init(115200, true, 2, false);
+  display.setRotation(DISPLAY_ROTATION);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+    display.setTextSize(2);
+    display.setCursor(12, 40);
+    display.print("Pocket Device");
+    display.setTextSize(1);
+    display.setCursor(12, 84);
+    display.print(line1);
+    display.setCursor(12, 104);
+    display.print(line2);
+    display.setCursor(12, 132);
+    display.print("IP: "); display.print(activeAddress);
+    display.setCursor(12, 152);
+    display.print("Fault: "); display.print(lastFaultStage);
+    display.print(" / "); display.print(lastFaultDetail);
+  } while (display.nextPage());
+  display.hibernate();
+  displayBusy = false;
+}
+
+String localWebPage() {
+  String html = "<html><body><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<h2>" BUILD_VERSION "</h2>";
+  html += "<p>Network: " + activeNetworkName + "<br>Address: " + activeAddress;
+  html += "<br>Current page: " + String(pageKeys[currentPage]);
+  html += "<br>Bundle revision: " + String(bundleRevision);
+  html += "<br>Fault: " + lastFaultStage + " / " + lastFaultDetail;
+  html += "<br>HTTP code: " + String(lastHttpCode);
+  html += "<br>Last URL: " + lastHttpUrl;
+  html += "<br>Free heap: " + String(ESP.getFreeHeap());
+  html += "<br>Free PSRAM: " + String(ESP.getFreePsram()) + "</p>";
+  html += "<ul>";
+  for (int i = 0; i < pageCount; i++) {
+    html += "<li>" + String(pageKeys[i]) + ": " + String(pages[i].loaded ? "loaded" : "missing") + " rev=" + String(pages[i].revision) + "</li>";
+  }
+  html += "</ul>";
+  html += "<p><a href='/next'>Next page</a> · <a href='/refresh'>Refresh from relay</a></p>";
+  html += "</body></html>";
+  return html;
+}
+
+void handleRoot() { server.send(200, "text/html", localWebPage()); }
+void handleNext() { currentPage = (currentPage + 1) % pageCount; drawCurrentPageToDisplay(false); server.sendHeader("Location", "/"); server.send(303); }
+void handleRefresh() { fetchMetaAndChangedPages(true); drawCurrentPageToDisplay(true); server.sendHeader("Location", "/"); server.send(303); }
+
+void handleButton() {
+  static bool wasDown = false;
+  static unsigned long downAt = 0;
+  static bool longHandled = false;
+  bool down = digitalRead(BTN_PAGE) == LOW;
+  unsigned long now = millis();
+
+  if (down && !wasDown) {
+    downAt = now;
+    longHandled = false;
+    wasDown = true;
+  }
+  if (down && wasDown && !longHandled && (now - downAt > 1200UL)) {
+    longHandled = true;
+    if (now - lastButtonChangeMs > 1000UL) {
+      lastButtonChangeMs = now;
+      fetchMetaAndChangedPages(true);
+      drawCurrentPageToDisplay(true);
+    }
+  }
+  if (!down && wasDown) {
+    unsigned long held = now - downAt;
+    wasDown = false;
+    if (!longHandled && held > 30UL && held < 1000UL) {
+      if (now - lastButtonChangeMs > 250UL) {
+        lastButtonChangeMs = now;
+        currentPage = (currentPage + 1) % pageCount;
+        drawCurrentPageToDisplay(false);
+      }
+    }
+  }
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
-
-  pinMode(BTN_NEXT, INPUT_PULLUP);
-  pinMode(BTN_PREV, INPUT_PULLUP);
-  pinMode(EPD_BUSY, INPUT);
-
+  delay(400);
   Serial.println();
-  Serial.println("Pocket e-paper pin/orientation test booting...");
-  Serial.println("Expected wiring:");
-  Serial.println("  BUSY->7, RST->8, DC->9, CS->10, DIN/MOSI->11, SCK->12, VCC->3V3, GND->GND");
-  Serial.println("Expected physical orientation: landscape, ribbon/cable edge facing user.");
-  Serial.print("Button GPIO14 state: "); Serial.println(digitalRead(BTN_NEXT));
-  Serial.print("Button GPIO13 state: "); Serial.println(digitalRead(BTN_PREV));
+  Serial.println("BOOT " BUILD_VERSION);
+  Serial.print("PSRAM: "); Serial.println(psramFound() ? "YES" : "NO");
+  allocatePageBuffers();
 
+  pinMode(BTN_PAGE, INPUT_PULLUP);
   SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
 
-  display.init(115200, true, 2, false);
-  display.setRotation(TEST_ROTATION);
+  connectPreferredOrFallback();
+  if (!usingFallbackAP) syncTimeNow();
 
-  display.setFullWindow();
-  display.firstPage();
-  do {
-    drawOrientationPattern();
-  } while (display.nextPage());
+  server.on("/", handleRoot);
+  server.on("/next", handleNext);
+  server.on("/refresh", handleRefresh);
+  server.begin();
 
-  display.hibernate();
-  Serial.println("Display test pattern sent. Device is now idle.");
+  bool ok = false;
+  if (safeForNetwork()) ok = fetchMetaAndChangedPages(true);
+  if (ok && pages[currentPage].loaded) {
+    drawCurrentPageToDisplay(true);
+  } else {
+    showStatusScreen("Relay fetch failed", activeNetworkName + " " + activeAddress);
+  }
+  lastPollMs = millis();
 }
 
 void loop() {
-  delay(1000);
+  server.handleClient();
+  handleButton();
+
+  if (!usingFallbackAP && WiFi.status() != WL_CONNECTED && !displayBusy) {
+    static unsigned long lastReconnect = 0;
+    if (millis() - lastReconnect > 60000UL) {
+      lastReconnect = millis();
+      connectPreferredOrFallback();
+    }
+  }
+
+  if (!displayBusy && safeForNetwork() && (millis() - lastPollMs > pollIntervalMs)) {
+    lastPollMs = millis();
+    bool beforeLoaded = pages[currentPage].loaded;
+    uint32_t beforeRev = pages[currentPage].revision;
+    fetchMetaAndChangedPages(false);
+    if (beforeLoaded && pages[currentPage].loaded && pages[currentPage].revision != beforeRev) {
+      drawCurrentPageToDisplay(false);
+    }
+  }
+  delay(1);
 }
