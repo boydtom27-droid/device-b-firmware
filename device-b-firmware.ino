@@ -41,7 +41,7 @@
 #include <esp_heap_caps.h>
 #include <GxEPD2_BW.h>
 
-#define BUILD_VERSION "PD_PAGE_CACHE_V3_EVENT_QUEUE"
+#define BUILD_VERSION "PD_PAGE_CACHE_V3_EVENT_QUEUE_TIMEFIX"
 
 #define EPD_BUSY 7
 #define EPD_RST  8
@@ -111,6 +111,7 @@ unsigned long lastPollMs = 0;
 const unsigned long pollIntervalMs = 60000UL;
 unsigned long lastTimeSyncMs = 0;
 const unsigned long timeSyncIntervalMs = 21600000UL; // 6 h
+bool timeSynced = false;
 
 const int MAX_PATTERN_STEPS = 16;
 const int MAX_EVENTS = 20;
@@ -209,7 +210,10 @@ void connectPreferredOrFallback() {
 }
 
 void syncTimeNow() {
-  if (usingFallbackAP || WiFi.status() != WL_CONNECTED) return;
+  if (usingFallbackAP || WiFi.status() != WL_CONNECTED) {
+    timeSynced = false;
+    return;
+  }
   setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0/2", 1);
   tzset();
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -217,11 +221,13 @@ void syncTimeNow() {
   for (int i = 0; i < 12; i++) {
     if (getLocalTime(&timeinfo)) {
       Serial.println("Time sync OK");
+      timeSynced = true;
       lastTimeSyncMs = millis();
       return;
     }
     delay(250);
   }
+  timeSynced = false;
   setFault("time", "ntp_failed");
 }
 
