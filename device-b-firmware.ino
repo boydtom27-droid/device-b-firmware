@@ -55,9 +55,9 @@
 // Haptic module logic-input pins. Connect module IN pins here; connect module
 // VCC to a suitable motor supply and module GND to ESP32 GND. If using only one
 // module, use HAPTIC_X and leave the other pins unconnected.
-#define HAPTIC_X 15
-#define HAPTIC_Y 16
-#define HAPTIC_Z 17
+#define HAPTIC_X 4
+#define HAPTIC_Y 2
+#define HAPTIC_Z 21
 #define HAPTIC_ACTIVE_HIGH true
 
 #define DISPLAY_ROTATION 0
