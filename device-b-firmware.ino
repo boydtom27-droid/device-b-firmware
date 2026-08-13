@@ -41,7 +41,7 @@
 #include <esp_heap_caps.h>
 #include <GxEPD2_BW.h>
 
-#define BUILD_VERSION "PD_PAGE_CACHE_V2_HAPTIC_ALERTS"
+#define BUILD_VERSION "PD_PAGE_CACHE_V3_EVENT_QUEUE"
 
 #define EPD_BUSY 7
 #define EPD_RST  8
@@ -113,19 +113,26 @@ unsigned long lastTimeSyncMs = 0;
 const unsigned long timeSyncIntervalMs = 21600000UL; // 6 h
 
 const int MAX_PATTERN_STEPS = 16;
-struct AlertState {
+const int MAX_EVENTS = 20;
+const int MAX_FIRED_KEYS = 32;
+
+struct PdEvent {
   bool active;
   bool popUp;
-  char key[80];
-  char state[16];
-  int repeatSeconds;
+  time_t epoch;
+  char key[96];
+  char type[16];
   int pattern[MAX_PATTERN_STEPS];
   int patternCount;
 };
-AlertState activeAlert;
-String lastFiredAlertKey = "";
-String lastAckedAlertKey = "";
-unsigned long lastAlertPatternMs = 0;
+
+PdEvent events[MAX_EVENTS];
+int eventCount = 0;
+uint32_t alertRevision = 0;
+uint32_t lastAckedAlertRevision = 0;
+char firedKeys[MAX_FIRED_KEYS][96];
+int firedKeyPos = 0;
+String activeAlarmKey = "";
 
 bool usingFallbackAP = false;
 String activeNetworkName = "";
@@ -331,13 +338,27 @@ void hapticOff() {
   hapticSet(false);
 }
 
-void runHapticPattern() {
-  if (!activeAlert.active || activeAlert.patternCount <= 0) return;
-  Serial.print("HAPTIC pattern for "); Serial.println(activeAlert.key);
-  for (int i = 0; i < activeAlert.patternCount; i++) {
+bool keyWasFired(const char* key) {
+  if (!key || key[0] == '\0') return true;
+  for (int i = 0; i < MAX_FIRED_KEYS; i++) {
+    if (strcmp(firedKeys[i], key) == 0) return true;
+  }
+  return false;
+}
+
+void markKeyFired(const char* key) {
+  if (!key || key[0] == '\0' || keyWasFired(key)) return;
+  strlcpy(firedKeys[firedKeyPos], key, sizeof(firedKeys[firedKeyPos]));
+  firedKeyPos = (firedKeyPos + 1) % MAX_FIRED_KEYS;
+}
+
+void runHapticPattern(const int* pattern, int patternCount, const char* label) {
+  if (!pattern || patternCount <= 0) return;
+  Serial.print("HAPTIC pattern for "); Serial.println(label ? label : "event");
+  for (int i = 0; i < patternCount; i++) {
     bool on = (i % 2) == 0;
     hapticSet(on);
-    unsigned long dur = (unsigned long)activeAlert.pattern[i];
+    unsigned long dur = (unsigned long)pattern[i];
     if (dur > 3000UL) dur = 3000UL;
     unsigned long start = millis();
     while (millis() - start < dur) {
@@ -346,80 +367,87 @@ void runHapticPattern() {
     }
   }
   hapticOff();
-  lastAlertPatternMs = millis();
-  lastFiredAlertKey = String(activeAlert.key);
 }
 
-void clearAlert() {
-  activeAlert.active = false;
-  activeAlert.popUp = false;
-  activeAlert.key[0] = '\0';
-  activeAlert.state[0] = '\0';
-  activeAlert.repeatSeconds = 300;
-  activeAlert.patternCount = 0;
+void clearEvents() {
+  eventCount = 0;
+  for (int i = 0; i < MAX_EVENTS; i++) {
+    events[i].active = false;
+    events[i].popUp = false;
+    events[i].epoch = 0;
+    events[i].key[0] = '\0';
+    events[i].type[0] = '\0';
+    events[i].patternCount = 0;
+  }
 }
 
-void parseAlertFromMeta(JsonObject alert) {
-  clearAlert();
-  if (alert.isNull()) return;
-  bool isActive = alert["active"] | false;
-  const char* key = alert["key"] | "none";
-  const char* state = alert["state"] | "none";
-  strlcpy(activeAlert.key, key, sizeof(activeAlert.key));
-  strlcpy(activeAlert.state, state, sizeof(activeAlert.state));
-  activeAlert.active = isActive && strcmp(key, "none") != 0;
-  activeAlert.popUp = alert["pop_up"] | false;
-  activeAlert.repeatSeconds = alert["repeat_seconds"] | 300;
-  if (activeAlert.repeatSeconds < 60) activeAlert.repeatSeconds = 60;
-  JsonArray pat = alert["pattern_ms"].as<JsonArray>();
+void parseEventsFromMeta(JsonArray arr) {
+  clearEvents();
+  if (arr.isNull()) return;
   int n = 0;
-  for (JsonVariant v : pat) {
-    if (n >= MAX_PATTERN_STEPS) break;
-    int ms = v.as<int>();
-    if (ms < 20) ms = 20;
-    if (ms > 3000) ms = 3000;
-    activeAlert.pattern[n++] = ms;
+  for (JsonObject ev : arr) {
+    if (n >= MAX_EVENTS) break;
+    const char* key = ev["key"] | "";
+    const char* type = ev["type"] | "prompt";
+    if ((!type || type[0] == '\0') && !ev["state"].isNull()) type = ev["state"];
+    if (!key || key[0] == '\0') continue;
+    events[n].active = true;
+    events[n].popUp = ev["pop_up"] | false;
+    events[n].epoch = (time_t)(ev["epoch"] | 0);
+    strlcpy(events[n].key, key, sizeof(events[n].key));
+    strlcpy(events[n].type, type, sizeof(events[n].type));
+    events[n].patternCount = 0;
+    JsonArray pat = ev["pattern_ms"].as<JsonArray>();
+    for (JsonVariant v : pat) {
+      if (events[n].patternCount >= MAX_PATTERN_STEPS) break;
+      int ms = v.as<int>();
+      if (ms < 20) ms = 20;
+      if (ms > 3000) ms = 3000;
+      events[n].pattern[events[n].patternCount++] = ms;
+    }
+    n++;
   }
-  activeAlert.patternCount = n;
+  eventCount = n;
+  Serial.print("Events loaded: "); Serial.println(eventCount);
 }
 
-bool alertIsAcked() {
-  if (!activeAlert.active) return true;
-  return lastAckedAlertKey == String(activeAlert.key);
-}
-
-void acknowledgeCurrentAlert() {
-  if (activeAlert.active) {
-    lastAckedAlertKey = String(activeAlert.key);
-    Serial.print("ALERT ACK "); Serial.println(lastAckedAlertKey);
+void acknowledgeActiveAlarm() {
+  if (currentPage == alarmPageIndex && activeAlarmKey.length() > 0) {
+    markKeyFired(activeAlarmKey.c_str());
+    Serial.print("ALARM DISMISS "); Serial.println(activeAlarmKey);
   }
+  activeAlarmKey = "";
   hapticOff();
 }
 
-void processAlertAfterSync(bool allowDraw) {
-  if (!activeAlert.active || alertIsAcked()) return;
-  String key = String(activeAlert.key);
-  bool isAlarm = strcmp(activeAlert.state, "alarm") == 0;
-  bool newKey = key != lastFiredAlertKey;
-  bool repeatDue = false;
-  if (isAlarm && !newKey) {
-    unsigned long repeatMs = (unsigned long)activeAlert.repeatSeconds * 1000UL;
-    repeatDue = (millis() - lastAlertPatternMs) > repeatMs;
-  }
+void processEvents(bool allowDraw) {
+  if (!timeSynced) return;
+  time_t nowT; time(&nowT);
+  for (int i = 0; i < eventCount; i++) {
+    PdEvent &ev = events[i];
+    if (!ev.active || ev.epoch <= 0) continue;
+    if (nowT < ev.epoch) continue;
+    if (keyWasFired(ev.key)) continue;
 
-  if (newKey || repeatDue) {
-    if (activeAlert.popUp && allowDraw && pages[alarmPageIndex].loaded) {
+    bool isAlert = strcmp(ev.type, "alert") == 0;
+    if (ev.popUp && isAlert && allowDraw && pages[alarmPageIndex].loaded) {
       if (currentPage != alarmPageIndex && currentPage < normalPageCount) lastNormalPage = currentPage;
       currentPage = alarmPageIndex;
+      activeAlarmKey = String(ev.key);
       drawCurrentPageToDisplay(true);
     }
-    runHapticPattern();
+
+    runHapticPattern(ev.pattern, ev.patternCount, ev.key);
+    // Alerts are not self-repeating. Nag repetition is relay-side via a new key
+    // in the next overdue interval. Prompt/timekeeping buzzes are also one-shot.
+    markKeyFired(ev.key);
+    break;
   }
 }
 
 bool httpPOSTAck(uint32_t rev) {
   if (!safeForNetwork()) return false;
-  String url = String(relayBaseUrl) + "/api/pd/ack?token=" + relayToken + "&bundle_revision=" + String(rev) + "&page=" + pageKeys[currentPage];
+  String url = String(relayBaseUrl) + "/api/pd/ack?token=" + relayToken + "&bundle_revision=" + String(rev) + "&alert_revision=" + String(alertRevision) + "&page=" + pageKeys[currentPage];
   WiFiClientSecure client;
   configureSecureClient(client);
   HTTPClient http;
@@ -427,7 +455,11 @@ bool httpPOSTAck(uint32_t rev) {
   if (!http.begin(client, url)) return false;
   int code = http.POST("");
   http.end();
-  return code >= 200 && code < 300;
+  if (code >= 200 && code < 300) {
+    lastAckedAlertRevision = alertRevision;
+    return true;
+  }
+  return false;
 }
 
 int pageIndexByKey(const char* key) {
@@ -493,7 +525,8 @@ bool fetchMetaAndChangedPages(bool force) {
     return false;
   }
   bundleRevision = doc["bundle_revision"] | 0;
-  parseAlertFromMeta(doc["alert"].as<JsonObject>());
+  alertRevision = doc["alert_revision"] | 0;
+  parseEventsFromMeta(doc["events"].as<JsonArray>());
   JsonArray arr = doc["pages"].as<JsonArray>();
   bool allOk = true;
   for (JsonObject p : arr) {
@@ -502,10 +535,10 @@ bool fetchMetaAndChangedPages(bool force) {
     if (!fetchOnePage(key, rev, force)) allOk = false;
   }
   lastMetaOkMs = millis();
-  if (allOk && bundleRevision != lastAckedBundleRevision) {
+  if (allOk && (bundleRevision != lastAckedBundleRevision || alertRevision != lastAckedAlertRevision)) {
     if (httpPOSTAck(bundleRevision)) lastAckedBundleRevision = bundleRevision;
   }
-  processAlertAfterSync(true);
+  processEvents(true);
   return allOk;
 }
 
@@ -595,9 +628,10 @@ String localWebPage() {
   html += "<br>Last URL: " + lastHttpUrl;
   html += "<br>Free heap: " + String(ESP.getFreeHeap());
   html += "<br>Free PSRAM: " + String(ESP.getFreePsram());
-  html += "<br>Alert: " + String(activeAlert.active ? activeAlert.key : "none");
-  html += " / state=" + String(activeAlert.state);
-  html += " / acked=" + String(alertIsAcked() ? "yes" : "no") + "</p>";
+  html += "<br>Alert revision: " + String(alertRevision);
+  html += " / acked=" + String(lastAckedAlertRevision);
+  html += "<br>Events cached: " + String(eventCount);
+  html += "<br>Active alarm key: " + activeAlarmKey + "</p>";
   html += "<ul>";
   for (int i = 0; i < pageCount; i++) {
     html += "<li>" + String(pageKeys[i]) + ": " + String(pages[i].loaded ? "loaded" : "missing") + " rev=" + String(pages[i].revision) + "</li>";
@@ -610,7 +644,7 @@ String localWebPage() {
 
 void handleRoot() { server.send(200, "text/html", localWebPage()); }
 void handleNext() {
-  if (currentPage == alarmPageIndex) acknowledgeCurrentAlert();
+  if (currentPage == alarmPageIndex) acknowledgeActiveAlarm();
   currentPage = (currentPage + 1) % normalPageCount;
   lastNormalPage = currentPage;
   drawCurrentPageToDisplay(false);
@@ -644,7 +678,7 @@ void handleButton() {
     if (!longHandled && held > 30UL && held < 1000UL) {
       if (now - lastButtonChangeMs > 250UL) {
         lastButtonChangeMs = now;
-        if (currentPage == alarmPageIndex) acknowledgeCurrentAlert();
+        if (currentPage == alarmPageIndex) acknowledgeActiveAlarm();
         currentPage = (currentPage + 1) % normalPageCount;
         lastNormalPage = currentPage;
         if (currentPage == 0 && WiFi.status() != WL_CONNECTED && !displayBusy) {
@@ -669,7 +703,7 @@ void setup() {
   pinMode(HAPTIC_Y, OUTPUT);
   pinMode(HAPTIC_Z, OUTPUT);
   hapticOff();
-  clearAlert();
+  clearEvents();
   SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
 
   connectPreferredOrFallback();
@@ -693,7 +727,7 @@ void setup() {
 void loop() {
   server.handleClient();
   handleButton();
-  processAlertAfterSync(true);
+  processEvents(true);
 
   if (!usingFallbackAP && WiFi.status() == WL_CONNECTED && !displayBusy && (millis() - lastTimeSyncMs > timeSyncIntervalMs)) {
     syncTimeNow();
