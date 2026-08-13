@@ -41,7 +41,7 @@
 #include <esp_heap_caps.h>
 #include <GxEPD2_BW.h>
 
-#define BUILD_VERSION "PD_PAGE_CACHE_V1_PGB1_2BPP"
+#define BUILD_VERSION "PD_PAGE_CACHE_V2_HAPTIC_ALERTS"
 
 #define EPD_BUSY 7
 #define EPD_RST  8
@@ -51,6 +51,14 @@
 #define EPD_SCK  12
 
 #define BTN_PAGE 14
+
+// Haptic module logic-input pins. Connect module IN pins here; connect module
+// VCC to a suitable motor supply and module GND to ESP32 GND. If using only one
+// module, use HAPTIC_X and leave the other pins unconnected.
+#define HAPTIC_X 15
+#define HAPTIC_Y 16
+#define HAPTIC_Z 17
+#define HAPTIC_ACTIVE_HIGH true
 
 #define DISPLAY_ROTATION 0
 #define PD_W 400
@@ -81,9 +89,11 @@ SavedNetwork preferredNetworks[] = {
 };
 const int preferredNetworkCount = sizeof(preferredNetworks) / sizeof(preferredNetworks[0]);
 
-const char* pageKeys[] = {"task", "idea", "calendar", "scribble"};
-const char* pageTitles[] = {"Tasks", "Ideas", "Calendar", "Scribble"};
-const int pageCount = 4;
+const char* pageKeys[] = {"task", "idea", "calendar", "calendar_week", "scribble", "alarm"};
+const char* pageTitles[] = {"Tasks", "Ideas", "Calendar", "Week", "Scribble", "Alarm"};
+const int pageCount = 6;
+const int normalPageCount = 5;   // alarm is a hidden/popup page
+const int alarmPageIndex = 5;
 
 struct CachedPage {
   const char* key;
@@ -91,13 +101,31 @@ struct CachedPage {
   bool loaded;
   uint8_t* payload;   // PGB1 data body only, not header
 };
-CachedPage pages[4];
+CachedPage pages[6];
 
 int currentPage = 0;
+int lastNormalPage = 0;
 uint32_t bundleRevision = 0;
 uint32_t lastAckedBundleRevision = 0;
 unsigned long lastPollMs = 0;
 const unsigned long pollIntervalMs = 60000UL;
+unsigned long lastTimeSyncMs = 0;
+const unsigned long timeSyncIntervalMs = 21600000UL; // 6 h
+
+const int MAX_PATTERN_STEPS = 16;
+struct AlertState {
+  bool active;
+  bool popUp;
+  char key[80];
+  char state[16];
+  int repeatSeconds;
+  int pattern[MAX_PATTERN_STEPS];
+  int patternCount;
+};
+AlertState activeAlert;
+String lastFiredAlertKey = "";
+String lastAckedAlertKey = "";
+unsigned long lastAlertPatternMs = 0;
 
 bool usingFallbackAP = false;
 String activeNetworkName = "";
@@ -182,6 +210,7 @@ void syncTimeNow() {
   for (int i = 0; i < 12; i++) {
     if (getLocalTime(&timeinfo)) {
       Serial.println("Time sync OK");
+      lastTimeSyncMs = millis();
       return;
     }
     delay(250);
@@ -291,6 +320,103 @@ bool httpGETBinaryToBuffer(const String& url, uint8_t* outBuf, size_t expectedLe
   return true;
 }
 
+void hapticSet(bool on) {
+  int level = (on == HAPTIC_ACTIVE_HIGH) ? HIGH : LOW;
+  digitalWrite(HAPTIC_X, level);
+  digitalWrite(HAPTIC_Y, level);
+  digitalWrite(HAPTIC_Z, level);
+}
+
+void hapticOff() {
+  hapticSet(false);
+}
+
+void runHapticPattern() {
+  if (!activeAlert.active || activeAlert.patternCount <= 0) return;
+  Serial.print("HAPTIC pattern for "); Serial.println(activeAlert.key);
+  for (int i = 0; i < activeAlert.patternCount; i++) {
+    bool on = (i % 2) == 0;
+    hapticSet(on);
+    unsigned long dur = (unsigned long)activeAlert.pattern[i];
+    if (dur > 3000UL) dur = 3000UL;
+    unsigned long start = millis();
+    while (millis() - start < dur) {
+      server.handleClient();
+      delay(5);
+    }
+  }
+  hapticOff();
+  lastAlertPatternMs = millis();
+  lastFiredAlertKey = String(activeAlert.key);
+}
+
+void clearAlert() {
+  activeAlert.active = false;
+  activeAlert.popUp = false;
+  activeAlert.key[0] = '\0';
+  activeAlert.state[0] = '\0';
+  activeAlert.repeatSeconds = 300;
+  activeAlert.patternCount = 0;
+}
+
+void parseAlertFromMeta(JsonObject alert) {
+  clearAlert();
+  if (alert.isNull()) return;
+  bool isActive = alert["active"] | false;
+  const char* key = alert["key"] | "none";
+  const char* state = alert["state"] | "none";
+  strlcpy(activeAlert.key, key, sizeof(activeAlert.key));
+  strlcpy(activeAlert.state, state, sizeof(activeAlert.state));
+  activeAlert.active = isActive && strcmp(key, "none") != 0;
+  activeAlert.popUp = alert["pop_up"] | false;
+  activeAlert.repeatSeconds = alert["repeat_seconds"] | 300;
+  if (activeAlert.repeatSeconds < 60) activeAlert.repeatSeconds = 60;
+  JsonArray pat = alert["pattern_ms"].as<JsonArray>();
+  int n = 0;
+  for (JsonVariant v : pat) {
+    if (n >= MAX_PATTERN_STEPS) break;
+    int ms = v.as<int>();
+    if (ms < 20) ms = 20;
+    if (ms > 3000) ms = 3000;
+    activeAlert.pattern[n++] = ms;
+  }
+  activeAlert.patternCount = n;
+}
+
+bool alertIsAcked() {
+  if (!activeAlert.active) return true;
+  return lastAckedAlertKey == String(activeAlert.key);
+}
+
+void acknowledgeCurrentAlert() {
+  if (activeAlert.active) {
+    lastAckedAlertKey = String(activeAlert.key);
+    Serial.print("ALERT ACK "); Serial.println(lastAckedAlertKey);
+  }
+  hapticOff();
+}
+
+void processAlertAfterSync(bool allowDraw) {
+  if (!activeAlert.active || alertIsAcked()) return;
+  String key = String(activeAlert.key);
+  bool isAlarm = strcmp(activeAlert.state, "alarm") == 0;
+  bool newKey = key != lastFiredAlertKey;
+  bool repeatDue = false;
+  if (isAlarm && !newKey) {
+    unsigned long repeatMs = (unsigned long)activeAlert.repeatSeconds * 1000UL;
+    repeatDue = (millis() - lastAlertPatternMs) > repeatMs;
+  }
+
+  if (newKey || repeatDue) {
+    if (activeAlert.popUp && allowDraw && pages[alarmPageIndex].loaded) {
+      if (currentPage != alarmPageIndex && currentPage < normalPageCount) lastNormalPage = currentPage;
+      currentPage = alarmPageIndex;
+      drawCurrentPageToDisplay(true);
+    }
+    runHapticPattern();
+  }
+}
+
 bool httpPOSTAck(uint32_t rev) {
   if (!safeForNetwork()) return false;
   String url = String(relayBaseUrl) + "/api/pd/ack?token=" + relayToken + "&bundle_revision=" + String(rev) + "&page=" + pageKeys[currentPage];
@@ -367,6 +493,7 @@ bool fetchMetaAndChangedPages(bool force) {
     return false;
   }
   bundleRevision = doc["bundle_revision"] | 0;
+  parseAlertFromMeta(doc["alert"].as<JsonObject>());
   JsonArray arr = doc["pages"].as<JsonArray>();
   bool allOk = true;
   for (JsonObject p : arr) {
@@ -378,6 +505,7 @@ bool fetchMetaAndChangedPages(bool force) {
   if (allOk && bundleRevision != lastAckedBundleRevision) {
     if (httpPOSTAck(bundleRevision)) lastAckedBundleRevision = bundleRevision;
   }
+  processAlertAfterSync(true);
   return allOk;
 }
 
@@ -466,7 +594,10 @@ String localWebPage() {
   html += "<br>HTTP code: " + String(lastHttpCode);
   html += "<br>Last URL: " + lastHttpUrl;
   html += "<br>Free heap: " + String(ESP.getFreeHeap());
-  html += "<br>Free PSRAM: " + String(ESP.getFreePsram()) + "</p>";
+  html += "<br>Free PSRAM: " + String(ESP.getFreePsram());
+  html += "<br>Alert: " + String(activeAlert.active ? activeAlert.key : "none");
+  html += " / state=" + String(activeAlert.state);
+  html += " / acked=" + String(alertIsAcked() ? "yes" : "no") + "</p>";
   html += "<ul>";
   for (int i = 0; i < pageCount; i++) {
     html += "<li>" + String(pageKeys[i]) + ": " + String(pages[i].loaded ? "loaded" : "missing") + " rev=" + String(pages[i].revision) + "</li>";
@@ -478,7 +609,13 @@ String localWebPage() {
 }
 
 void handleRoot() { server.send(200, "text/html", localWebPage()); }
-void handleNext() { currentPage = (currentPage + 1) % pageCount; drawCurrentPageToDisplay(false); server.sendHeader("Location", "/"); server.send(303); }
+void handleNext() {
+  if (currentPage == alarmPageIndex) acknowledgeCurrentAlert();
+  currentPage = (currentPage + 1) % normalPageCount;
+  lastNormalPage = currentPage;
+  drawCurrentPageToDisplay(false);
+  server.sendHeader("Location", "/"); server.send(303);
+}
 void handleRefresh() { fetchMetaAndChangedPages(true); drawCurrentPageToDisplay(true); server.sendHeader("Location", "/"); server.send(303); }
 
 void handleButton() {
@@ -507,7 +644,12 @@ void handleButton() {
     if (!longHandled && held > 30UL && held < 1000UL) {
       if (now - lastButtonChangeMs > 250UL) {
         lastButtonChangeMs = now;
-        currentPage = (currentPage + 1) % pageCount;
+        if (currentPage == alarmPageIndex) acknowledgeCurrentAlert();
+        currentPage = (currentPage + 1) % normalPageCount;
+        lastNormalPage = currentPage;
+        if (currentPage == 0 && WiFi.status() != WL_CONNECTED && !displayBusy) {
+          connectPreferredOrFallback();
+        }
         drawCurrentPageToDisplay(false);
       }
     }
@@ -523,6 +665,11 @@ void setup() {
   allocatePageBuffers();
 
   pinMode(BTN_PAGE, INPUT_PULLUP);
+  pinMode(HAPTIC_X, OUTPUT);
+  pinMode(HAPTIC_Y, OUTPUT);
+  pinMode(HAPTIC_Z, OUTPUT);
+  hapticOff();
+  clearAlert();
   SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
 
   connectPreferredOrFallback();
@@ -546,6 +693,11 @@ void setup() {
 void loop() {
   server.handleClient();
   handleButton();
+  processAlertAfterSync(true);
+
+  if (!usingFallbackAP && WiFi.status() == WL_CONNECTED && !displayBusy && (millis() - lastTimeSyncMs > timeSyncIntervalMs)) {
+    syncTimeNow();
+  }
 
   if (!usingFallbackAP && WiFi.status() != WL_CONNECTED && !displayBusy) {
     static unsigned long lastReconnect = 0;
