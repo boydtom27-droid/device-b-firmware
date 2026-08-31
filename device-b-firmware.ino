@@ -13,7 +13,7 @@
 #include <Fonts/FreeMono9pt7b.h>
 #include <string.h>
 
-#define BUILD_VERSION "DEVICE_B_WD_HAPTIC_ALARMS_V1_NO_OTA"
+#define BUILD_VERSION "DEVICE_B_WD_HAPTIC_ALARMS_V2_GUARDED_NO_OTA"
 
 #define CS 10
 #define DC 9
@@ -193,6 +193,18 @@ WallEvent activeWallAlarmEvent;
 unsigned long lastWallEventCheck = 0;
 const unsigned long wallEventCheckIntervalMs = 1000UL;
 
+// Wall alarm timing/safety. Duration 0 means continuous until relay mute.
+uint16_t wdAlarmDurationSeconds = 30;
+unsigned long wdMuteRevision = 0;
+unsigned long lastSeenWdMuteRevision = 0;
+bool wdMuteRevisionInitialized = false;
+unsigned long activeWallAlarmStartMillis = 0;
+unsigned long activeWallAlarmStepMillis = 0;
+uint8_t activeWallAlarmPatternIndex = 0;
+const unsigned long wallAlarmGuardWindowSeconds = 30UL;
+unsigned long lastAlarmMetaPoll = 0;
+const unsigned long alarmMetaPollIntervalMs = 5000UL;
+
 
 bool tryConnectOneNetwork(const char* ssid, const char* password, unsigned long timeoutMs);
 void stopMDNS();
@@ -225,6 +237,11 @@ void runHapticPattern(const WallEvent &ev);
 void setHaptic(bool on);
 bool drawWallAlarmScreen(const WallEvent &ev);
 bool ackWallAlertRevision(unsigned long rev);
+bool wallAlarmDueSoon();
+void serviceActiveWallAlarm();
+void endActiveWallAlarm(const char* reason);
+bool tryBeginWallAlarm(WallEvent &ev);
+bool isPopupAlert(const WallEvent &ev);
 
 void setFault(const String &stage, const String &detail) {
   lastFaultStage = stage;
@@ -327,6 +344,8 @@ void setHaptic(bool on) {
 }
 
 void runHapticPattern(const WallEvent &ev) {
+  // Blocking pattern is retained for prompt/nag only. Popup alerts use the
+  // non-blocking active-alarm service so the firmware can still check duration/mute.
   if (ev.patternLen == 0) return;
   for (uint8_t i = 0; i < ev.patternLen; i++) {
     setHaptic((i % 2) == 0);
@@ -361,6 +380,8 @@ void drawWrappedAlarmText(const String &txt, int x, int y, int maxChars, int lin
 }
 
 bool drawWallAlarmScreen(const WallEvent &ev) {
+  // Alarm screen may not interrupt an already-started e-paper refresh, but it is
+  // allowed to bypass the ordinary post-refresh network quiet period.
   if (refreshInProgress || displayBusyPhase) return false;
   refreshInProgress = true;
   displayBusyPhase = true;
@@ -392,16 +413,101 @@ bool drawWallAlarmScreen(const WallEvent &ev) {
   return true;
 }
 
-void fireWallEvent(WallEvent &ev) {
-  if (ev.fired) return;
+bool isPopupAlert(const WallEvent &ev) {
+  return ev.popUp || strcmp(ev.type, "alert") == 0;
+}
+
+bool wallAlarmDueSoon() {
+  if (!timeSynced || activeWallAlarm) return false;
+  time_t nowT; time(&nowT);
+  unsigned long nowEpoch = (unsigned long)nowT;
+  for (int i = 0; i < wallEventCount; i++) {
+    WallEvent &ev = wallEvents[i];
+    if (!ev.fired && ev.epoch > nowEpoch && isPopupAlert(ev) && ev.epoch <= nowEpoch + wallAlarmGuardWindowSeconds) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool tryBeginWallAlarm(WallEvent &ev) {
+  if (ev.fired) return true;
+  if (refreshInProgress || displayBusyPhase) {
+    setFault("alarm", "pending_display_busy");
+    return false;
+  }
+  if (!drawWallAlarmScreen(ev)) {
+    setFault("alarm", "pending_screen_busy");
+    return false;
+  }
   ev.fired = true;
   rememberFiredKey(ev.key);
+  activeWallAlarmEvent = ev;
+  activeWallAlarm = true;
+  activeWallAlarmStartMillis = millis();
+  activeWallAlarmStepMillis = 0;
+  activeWallAlarmPatternIndex = 0;
+  Serial.print("WD active alarm started: "); Serial.println(ev.key);
+  return true;
+}
+
+void fireWallEvent(WallEvent &ev) {
+  if (ev.fired) return;
   Serial.print("WD fire event: "); Serial.print(ev.type); Serial.print(" "); Serial.println(ev.key);
+  if (isPopupAlert(ev)) {
+    // Do not mark the event fired until the alarm page has actually been drawn.
+    tryBeginWallAlarm(ev);
+    return;
+  }
+  ev.fired = true;
+  rememberFiredKey(ev.key);
   runHapticPattern(ev);
-  if (strcmp(ev.type, "alert") == 0 || ev.popUp) {
-    activeWallAlarmEvent = ev;
-    activeWallAlarm = true;
-    drawWallAlarmScreen(activeWallAlarmEvent);
+}
+
+void endActiveWallAlarm(const char* reason) {
+  if (!activeWallAlarm) return;
+  setHaptic(false);
+  activeWallAlarm = false;
+  activeWallAlarmStartMillis = 0;
+  activeWallAlarmStepMillis = 0;
+  activeWallAlarmPatternIndex = 0;
+  lastSeenWdMuteRevision = wdMuteRevision;
+  Serial.print("WD alarm ended: "); Serial.println(reason ? reason : "done");
+  renderJobQueued = true;
+  deviceState = STATE_POLL_META;
+}
+
+void serviceActiveWallAlarm() {
+  if (!activeWallAlarm) return;
+
+  if (wdMuteRevision > lastSeenWdMuteRevision) {
+    endActiveWallAlarm("relay_mute");
+    return;
+  }
+
+  if (wdAlarmDurationSeconds > 0 && activeWallAlarmStartMillis > 0 &&
+      millis() - activeWallAlarmStartMillis >= (unsigned long)wdAlarmDurationSeconds * 1000UL) {
+    endActiveWallAlarm("duration_elapsed");
+    return;
+  }
+
+  const WallEvent &ev = activeWallAlarmEvent;
+  if (ev.patternLen == 0) return;
+
+  unsigned long nowMs = millis();
+  if (activeWallAlarmStepMillis == 0) {
+    activeWallAlarmPatternIndex = 0;
+    activeWallAlarmStepMillis = nowMs;
+    setHaptic(true);
+    return;
+  }
+
+  uint16_t dur = ev.pattern[activeWallAlarmPatternIndex];
+  if (nowMs - activeWallAlarmStepMillis >= dur) {
+    activeWallAlarmPatternIndex++;
+    if (activeWallAlarmPatternIndex >= ev.patternLen) activeWallAlarmPatternIndex = 0;
+    activeWallAlarmStepMillis = nowMs;
+    setHaptic((activeWallAlarmPatternIndex % 2) == 0);
   }
 }
 
@@ -881,6 +987,13 @@ bool fetchRelayMetaNow(RelayMeta &meta) {
   meta.forceOTA = doc["force_ota"] | 0;
   meta.firmwareVersionFromRelay = doc["firmware_version"] | "";
   latestWdAlertRevision = doc["wd_alert_revision"] | 0;
+  wdAlarmDurationSeconds = doc["wd_alarm_duration_seconds"] | wdAlarmDurationSeconds;
+  unsigned long incomingMuteRevision = doc["wd_mute_revision"] | wdMuteRevision;
+  if (!wdMuteRevisionInitialized) {
+    lastSeenWdMuteRevision = incomingMuteRevision;
+    wdMuteRevisionInitialized = true;
+  }
+  wdMuteRevision = incomingMuteRevision;
   JsonArray wdEvents = doc["wd_events"].as<JsonArray>();
   if (!wdEvents.isNull()) parseWallEvents(wdEvents);
   lastSuccessfulMetaMillis = millis();
@@ -1349,8 +1462,24 @@ void handleButtonRefresh() {
 }
 
 void runStateMachine() {
+  // While an alarm is active, normal render/fetch work is blocked. Metadata polling
+  // is still allowed so the relay-side mute button can be received.
+  if (activeWallAlarm) {
+    if (safeForNetwork() && millis() - lastAlarmMetaPoll > alarmMetaPollIntervalMs) {
+      RelayMeta alarmMeta;
+      fetchRelayMetaNow(alarmMeta);
+      lastAlarmMetaPoll = millis();
+    }
+    return;
+  }
+
   switch (deviceState) {
     case STATE_IDLE:
+      // Do not start network/render work in the final countdown window. This
+      // prevents a long e-paper refresh from being launched shortly before alarm time.
+      if (wallAlarmDueSoon()) {
+        break;
+      }
       // Network manager: poll only when display is fully idle and post-display quiet period has expired.
       if (safeForNetwork() && (millis() - lastMetaPoll > metaPollInterval)) {
         deviceState = STATE_POLL_META;
@@ -1362,7 +1491,7 @@ void runStateMachine() {
 
     case STATE_POLL_META:
       // Network phase only. No display calls here.
-      if (!safeForNetwork()) {
+      if (!safeForNetwork() || wallAlarmDueSoon()) {
         deviceState = STATE_IDLE;
         break;
       }
@@ -1384,7 +1513,7 @@ void runStateMachine() {
 
     case STATE_FETCH_JOB:
       // Network phase only. A successful fetch populates the local render cache.
-      if (!safeForNetwork()) {
+      if (!safeForNetwork() || wallAlarmDueSoon()) {
         deviceState = STATE_IDLE;
         break;
       }
@@ -1402,6 +1531,10 @@ void runStateMachine() {
 
     case STATE_RENDER_JOB:
       // Display phase only. No HTTP/JSON/WiFi calls inside updateDisplayFromRenderOps().
+      if (wallAlarmDueSoon()) {
+        deviceState = STATE_IDLE;
+        break;
+      }
       if (!refreshInProgress && !displayBusyPhase && renderOpCount > 0) {
         if (updateDisplayFromRenderOps()) {
           deviceState = STATE_ACK_JOB;
@@ -1459,7 +1592,7 @@ void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("BOOT: DEVICE_B_CLEAN_SCHEDULER_V9_TEXT_BITMAP_REMOTE_NO_OTA");
+  Serial.println("BOOT: DEVICE_B_WD_HAPTIC_ALARMS_V2_GUARDED_NO_OTA");
   ensureScribbleBuffers();
   printMemoryDiagnostics("boot");
 
@@ -1523,6 +1656,7 @@ void loop() {
     reconnectPreferredIfNeeded(false);
   }
   handleButtonRefresh();
+  serviceActiveWallAlarm();
   if (!activeWallAlarm) processWallEvents();
   runStateMachine();
 
@@ -1532,6 +1666,7 @@ void loop() {
       millis() >= displayQuietUntil &&
       !renderJobQueued &&
       !activeWallAlarm &&
+      !wallAlarmDueSoon() &&
       (millis() - lastTimedMainRefresh > timedMainRefreshInterval)) {
     Serial.println("TIMED MAIN FULL REFRESH");
     if (renderOpCount > 0) updateDisplayFromRenderOps();
