@@ -1,34 +1,34 @@
 /*
-  Pocket Device firmware - PD page-cache build
+  Clip Device (CD) Build 1 C6
+  Waveshare ESP32-C6-Zero / Mini + Waveshare 2.13" 250x122 B/W e-paper HAT V4
 
-  Hardware target:
-    - ESP32-S3 Waveshare ESP32-S3-DEV-KIT-N8R8/N8RX style board
-    - Waveshare Pico-ePaper-4.2, 400x300, B/W with 4 grey-scale source payload
+  Relay endpoints used by this firmware only:
+    /api/cd/meta
+    /api/cd/page?page=focus|ideas|week
+    /api/cd/ack
 
-  Wiring used by this build:
-    Display BUSY -> GPIO7
-    Display RST  -> GPIO8
-    Display DC   -> GPIO9
-    Display CS   -> GPIO10
-    Display DIN  -> GPIO11
-    Display SCK  -> GPIO12
-    Display GND  -> GND
+  ESP32-C6-Zero display connector allocation, chosen to avoid:
+    - GPIO8: onboard WS2812 RGB LED
+    - GPIO9: BOOT strapping/button pin
+    - GPIO12/GPIO13: commonly associated with USB Serial/JTAG on ESP32-C6
+
     Display VCC  -> 3V3
-    Button       -> GPIO14 to GND, INPUT_PULLUP
+    Display GND  -> GND
+    Display DIN  -> GPIO21  (MOSI)
+    Display CLK  -> GPIO20  (SCK)
+    Display CS   -> GPIO19
+    Display DC   -> GPIO18
+    Display RST  -> GPIO5
+    Display BUSY -> GPIO4
 
-  Relay endpoints used by this firmware:
-    /api/pd/meta
-    /api/pd/page?page=task|idea|calendar|scribble
-    /api/pd/ack
+  Button:
+    GPIO14 -> momentary switch -> GND, INPUT_PULLUP
+      short press: next page
+      long press: force relay refresh
 
-  Notes:
-    - The relay sends PGB1 binary pages: 400x300, 2 bits per pixel.
-    - This firmware stores the 2bpp greyscale pages in PSRAM and renders them
-      to the black/white panel using ordered spatial dithering. This preserves
-      the relay's greyscale intent even if the installed GxEPD2 driver does not
-      expose native 4-grey waveform drawing for this exact panel revision.
-    - If your GxEPD2 library does not contain GxEPD2_420_GDEY042T81, change the
-      EPD class below to GxEPD2_420 or GxEPD2_420_M01 and retest orientation.
+  Optional haptic later:
+    GPIO15 -> MOSFET/driver input only. Do not drive a motor directly from GPIO.
+    ENABLE_HAPTIC is 0 by default for safety.
 */
 
 #include <WiFi.h>
@@ -38,43 +38,33 @@
 #include <ArduinoJson.h>
 #include <SPI.h>
 #include <time.h>
-#include <esp_heap_caps.h>
 #include <GxEPD2_BW.h>
 
-#define BUILD_VERSION "PD_PAGE_CACHE_V3_EVENT_QUEUE_TIMEFIX"
+#define BUILD_VERSION "CD_BUILD2_C6_PROMPT_PAGES_EVENT_QUEUE"
 
-#define EPD_BUSY 7
-#define EPD_RST  8
-#define EPD_DC   9
-#define EPD_CS   10
-#define EPD_MOSI 11
-#define EPD_SCK  12
+// -------- Pins --------
+#define EPD_BUSY 4
+#define EPD_RST  5
+#define EPD_DC   18
+#define EPD_CS   19
+#define EPD_MOSI 21
+#define EPD_SCK  20
 
-#define BTN_PAGE 14
+#define CD_BUTTON_PIN 14
+#define HAPTIC_PIN    15
+#define ENABLE_HAPTIC 1
 
-// Haptic module logic-input pins. Connect module IN pins here; connect module
-// VCC to a suitable motor supply and module GND to ESP32 GND. If using only one
-// module, use HAPTIC_X and leave the other pins unconnected.
-#define HAPTIC_X 4
-#define HAPTIC_Y 2
-#define HAPTIC_Z 21
-#define HAPTIC_ACTIVE_HIGH true
+// Set to 1 for landscape. If the image is upside down, change to 3.
+#define CD_ROTATION 1
 
-#define DISPLAY_ROTATION 0
-#define PD_W 400
-#define PD_H 300
-#define PGB_HEADER_BYTES 10
-#define PGB_DATA_BYTES (((PD_W * PD_H * 2) + 7) / 8)
-#define PGB_TOTAL_BYTES (PGB_HEADER_BYTES + PGB_DATA_BYTES)
-
-// Preferred display class for Waveshare 4.2" V2 style 400x300 black/white panel.
-// Alternatives if compilation fails: GxEPD2_420, GxEPD2_420_M01.
-GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> display(
-  GxEPD2_420_GDEY042T81(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
+// Waveshare 2.13" HAT V4, 250x122 B/W. If this class is not available in your
+// installed GxEPD2 version, try GxEPD2_213_B74 or GxEPD2_213_BN alternatives
+// from the GxEPD2 display selection examples.
+GxEPD2_BW<GxEPD2_213_BN, GxEPD2_213_BN::HEIGHT> display(
+  GxEPD2_213_BN(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
 );
 
-WebServer server(80);
-
+// -------- Relay / network --------
 const char* relayBaseUrl = "https://device-b-relay.onrender.com";
 const char* relayToken = "abc123xyz789";
 
@@ -82,6 +72,7 @@ struct SavedNetwork {
   const char* ssid;
   const char* password;
 };
+
 SavedNetwork preferredNetworks[] = {
   {"Tomspot", "Tom00001"},
   {"VM6269662", "FollyDaRabbit123"},
@@ -89,35 +80,40 @@ SavedNetwork preferredNetworks[] = {
 };
 const int preferredNetworkCount = sizeof(preferredNetworks) / sizeof(preferredNetworks[0]);
 
-const char* pageKeys[] = {"task", "idea", "calendar", "calendar_week", "scribble", "alarm"};
-const char* pageTitles[] = {"Tasks", "Ideas", "Calendar", "Week", "Scribble", "Alarm"};
-const int pageCount = 6;
-const int normalPageCount = 5;   // alarm is a hidden/popup page
-const int alarmPageIndex = 5;
+const char* fallbackApSSID = "ClipDevice";
+const char* fallbackApPassword = "clip12345";
+bool usingFallbackAP = false;
+String activeNetworkName = "";
+String activeAddress = "";
 
-struct CachedPage {
-  const char* key;
-  uint32_t revision;
-  bool loaded;
-  uint8_t* payload;   // PGB1 data body only, not header
-};
-CachedPage pages[6];
+WebServer server(80);
 
-int currentPage = 0;
-int lastNormalPage = 0;
+// -------- CD page cache --------
+const int CD_W = 250;
+const int CD_H = 122;
+const size_t CD_ROW_BYTES = (CD_W + 7) / 8;
+const size_t CD_PAGE_BYTES = CD_ROW_BYTES * CD_H;
+const size_t CD_CONTIG_PAGE_BYTES = ((CD_W * CD_H) + 7) / 8;
+const int CD_PAGE_COUNT = 7;
+const int CD_NORMAL_PAGE_COUNT = 6;
+const int CD_ALARM_PAGE_INDEX = 6;
+const char* CD_PAGE_KEYS[CD_PAGE_COUNT] = {"tasks", "schedule", "ideas_1", "ideas_2", "week_now", "week_next", "alarm"};
+const char* CD_PAGE_TITLES[CD_PAGE_COUNT] = {"Tasks", "Today", "Ideas 1", "Ideas 2", "This week", "Next week", "Alarm"};
+
+uint8_t pageCache[CD_PAGE_COUNT][CD_PAGE_BYTES];
+bool pageLoaded[CD_PAGE_COUNT] = {false, false, false, false, false, false, false};
+uint32_t pageRevision[CD_PAGE_COUNT] = {0, 0, 0, 0, 0, 0, 0};
 uint32_t bundleRevision = 0;
 uint32_t lastAckedBundleRevision = 0;
-unsigned long lastPollMs = 0;
-const unsigned long pollIntervalMs = 60000UL;
-unsigned long lastTimeSyncMs = 0;
-const unsigned long timeSyncIntervalMs = 21600000UL; // 6 h
-bool timeSynced = false;
+uint32_t alertRevision = 0;
+uint32_t lastAckedAlertRevision = 0;
+int currentPage = 0;
+int lastNormalPage = 0;
 
 const int MAX_PATTERN_STEPS = 16;
 const int MAX_EVENTS = 20;
 const int MAX_FIRED_KEYS = 32;
-
-struct PdEvent {
+struct CdEvent {
   bool active;
   bool popUp;
   time_t epoch;
@@ -126,27 +122,44 @@ struct PdEvent {
   int pattern[MAX_PATTERN_STEPS];
   int patternCount;
 };
-
-PdEvent events[MAX_EVENTS];
+CdEvent events[MAX_EVENTS];
 int eventCount = 0;
-uint32_t alertRevision = 0;
-uint32_t lastAckedAlertRevision = 0;
 char firedKeys[MAX_FIRED_KEYS][96];
 int firedKeyPos = 0;
 String activeAlarmKey = "";
+String alertState = "none";
 
-bool usingFallbackAP = false;
-String activeNetworkName = "";
-String activeAddress = "";
+// Diagnostics.
 String lastFaultStage = "none";
 String lastFaultDetail = "";
 int lastHttpCode = 0;
 String lastHttpUrl = "";
+unsigned long lastPollMs = 0;
 unsigned long lastRenderMs = 0;
-unsigned long lastMetaOkMs = 0;
-unsigned long lastPageOkMs = 0;
-unsigned long lastButtonChangeMs = 0;
-bool displayBusy = false;
+unsigned long lastSuccessfulSyncMs = 0;
+const unsigned long metaPollIntervalMs = 60000UL;
+const unsigned long httpTimeoutMs = 18000UL;
+
+bool timeSynced = false;
+
+// -------- Forward declarations --------
+void connectPreferredOrFallback();
+bool tryConnectOneNetwork(const char* ssid, const char* password, unsigned long timeoutMs);
+bool safeForNetwork();
+bool httpGETString(const String& url, String& out);
+bool httpGETBinary(const String& url, uint8_t* buf, size_t maxLen, size_t& outLen);
+bool httpPOSTEmpty(const String& url);
+bool fetchCdMetaAndPages(bool forceAll);
+bool fetchCdPage(int idx, const String& url, uint32_t revision);
+void drawCurrentPage();
+void drawPageBitmap(const uint8_t* bits);
+void handleButton();
+void processEvents(bool allowDraw);
+void runHapticPattern(const int* pattern, int patternCount, const char* label);
+void acknowledgeActiveAlarm();
+void syncTimeNow();
+void setFault(const String& stage, const String& detail);
+String localWebpage();
 
 void setFault(const String& stage, const String& detail) {
   lastFaultStage = stage;
@@ -154,24 +167,9 @@ void setFault(const String& stage, const String& detail) {
   Serial.print("FAULT "); Serial.print(stage); Serial.print(": "); Serial.println(detail);
 }
 
-void allocatePageBuffers() {
-  for (int i = 0; i < pageCount; i++) {
-    pages[i].key = pageKeys[i];
-    pages[i].revision = 0;
-    pages[i].loaded = false;
-    pages[i].payload = (uint8_t*)heap_caps_malloc(PGB_DATA_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!pages[i].payload) pages[i].payload = (uint8_t*)malloc(PGB_DATA_BYTES);
-    if (!pages[i].payload) {
-      setFault("memory", String("page_alloc_") + pageKeys[i]);
-    } else {
-      memset(pages[i].payload, 0xFF, PGB_DATA_BYTES);
-    }
-  }
-}
-
 bool tryConnectOneNetwork(const char* ssid, const char* password, unsigned long timeoutMs) {
   if (!ssid || strlen(ssid) == 0) return false;
-  Serial.print("WiFi trying: "); Serial.println(ssid);
+  Serial.print("Trying WiFi: "); Serial.println(ssid);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   unsigned long start = millis();
@@ -180,23 +178,20 @@ bool tryConnectOneNetwork(const char* ssid, const char* password, unsigned long 
     delay(250);
   }
   WiFi.disconnect(true, true);
-  delay(300);
+  delay(250);
   return false;
 }
 
 void startFallbackAP() {
   WiFi.mode(WIFI_AP);
-  WiFi.softAP("PocketDevice", "tasks123");
+  WiFi.softAP(fallbackApSSID, fallbackApPassword);
   usingFallbackAP = true;
-  activeNetworkName = "Fallback AP";
+  activeNetworkName = "AP";
   activeAddress = WiFi.softAPIP().toString();
 }
 
 void connectPreferredOrFallback() {
   usingFallbackAP = false;
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);
-  delay(300);
   for (int i = 0; i < preferredNetworkCount; i++) {
     if (tryConnectOneNetwork(preferredNetworks[i].ssid, preferredNetworks[i].password, 8000)) {
       activeNetworkName = preferredNetworks[i].ssid;
@@ -205,24 +200,24 @@ void connectPreferredOrFallback() {
       return;
     }
   }
-  setFault("wifi", "preferred_failed_fallback_ap");
+  Serial.println("WiFi failed; starting fallback AP");
   startFallbackAP();
 }
 
+bool safeForNetwork() {
+  return (!usingFallbackAP && WiFi.status() == WL_CONNECTED);
+}
+
 void syncTimeNow() {
-  if (usingFallbackAP || WiFi.status() != WL_CONNECTED) {
-    timeSynced = false;
-    return;
-  }
+  if (!safeForNetwork()) { timeSynced = false; return; }
   setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0/2", 1);
   tzset();
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  struct tm timeinfo;
-  for (int i = 0; i < 12; i++) {
-    if (getLocalTime(&timeinfo)) {
-      Serial.println("Time sync OK");
+  struct tm info;
+  for (int i = 0; i < 16; i++) {
+    if (getLocalTime(&info)) {
       timeSynced = true;
-      lastTimeSyncMs = millis();
+      Serial.println("Time sync OK");
       return;
     }
     delay(250);
@@ -231,40 +226,26 @@ void syncTimeNow() {
   setFault("time", "ntp_failed");
 }
 
-bool safeForNetwork() {
-  if (displayBusy) return false;
-  if (usingFallbackAP) return false;
-  if (WiFi.status() != WL_CONNECTED) return false;
-  return true;
-}
-
-bool configureSecureClient(WiFiClientSecure& client) {
+bool configureSecure(WiFiClientSecure& client) {
   client.setInsecure();
   client.setHandshakeTimeout(30);
   return true;
 }
 
-bool httpGETText(const String& url, String& out) {
-  out = "";
+bool httpGETString(const String& url, String& out) {
   lastHttpUrl = url;
   lastHttpCode = 0;
-  if (!safeForNetwork()) {
-    setFault("connection", usingFallbackAP ? "fallback_ap" : "wifi_or_display_busy");
-    return false;
-  }
+  if (!safeForNetwork()) { setFault("net", "not_connected"); return false; }
   WiFiClientSecure client;
-  configureSecureClient(client);
+  configureSecure(client);
   HTTPClient http;
-  http.setTimeout(25000);
+  http.setTimeout(httpTimeoutMs);
   http.setReuse(false);
-  if (!http.begin(client, url)) {
-    setFault("http", "begin_failed");
-    return false;
-  }
+  if (!http.begin(client, url)) { setFault("http", "begin_failed"); return false; }
   int code = http.GET();
   lastHttpCode = code;
   if (code != 200) {
-    setFault("http", String("GET_") + code);
+    setFault("http", String("GET_") + String(code));
     http.end();
     return false;
   }
@@ -275,74 +256,67 @@ bool httpGETText(const String& url, String& out) {
   return true;
 }
 
-bool httpGETBinaryToBuffer(const String& url, uint8_t* outBuf, size_t expectedLen, size_t& got) {
-  got = 0;
+bool httpGETBinary(const String& url, uint8_t* buf, size_t maxLen, size_t& outLen) {
+  outLen = 0;
   lastHttpUrl = url;
   lastHttpCode = 0;
-  if (!safeForNetwork()) {
-    setFault("connection", usingFallbackAP ? "fallback_ap" : "wifi_or_display_busy");
-    return false;
-  }
+  if (!safeForNetwork()) { setFault("net", "not_connected"); return false; }
   WiFiClientSecure client;
-  configureSecureClient(client);
+  configureSecure(client);
   HTTPClient http;
-  http.setTimeout(35000);
+  http.setTimeout(httpTimeoutMs);
   http.setReuse(false);
-  if (!http.begin(client, url)) {
-    setFault("http", "binary_begin_failed");
-    return false;
-  }
+  if (!http.begin(client, url)) { setFault("http", "bin_begin_failed"); return false; }
   int code = http.GET();
   lastHttpCode = code;
   if (code != 200) {
-    setFault("http", String("BIN_GET_") + code);
+    setFault("http", String("BIN_GET_") + String(code));
     http.end();
     return false;
   }
   int len = http.getSize();
-  if (len > 0 && (size_t)len != expectedLen) {
-    setFault("http", String("binary_size_") + len);
+  if (len <= 0 || (size_t)len > maxLen) {
+    setFault("http", String("bad_bin_size_") + String(len));
     http.end();
     return false;
   }
   WiFiClient* stream = http.getStreamPtr();
+  size_t total = 0;
   unsigned long lastProgress = millis();
-  while (got < expectedLen) {
+  while (total < (size_t)len) {
     int avail = stream->available();
     if (avail > 0) {
-      size_t toRead = expectedLen - got;
-      if (toRead > (size_t)avail) toRead = (size_t)avail;
-      if (toRead > 1024) toRead = 1024;
-      size_t n = stream->readBytes(outBuf + got, toRead);
-      if (n > 0) {
-        got += n;
-        lastProgress = millis();
-      }
+      size_t remaining = (size_t)len - total;
+      size_t toRead = remaining < (size_t)avail ? remaining : (size_t)avail;
+      if (toRead > 512) toRead = 512;
+      size_t n = stream->readBytes(buf + total, toRead);
+      if (n > 0) { total += n; lastProgress = millis(); }
     } else {
       delay(5);
     }
-    if (millis() - lastProgress > 15000UL) {
-      setFault("http", "binary_timeout");
-      http.end();
-      return false;
-    }
+    if (millis() - lastProgress > 8000UL) break;
   }
   http.end();
+  if (total != (size_t)len) {
+    setFault("http", "binary_short_read");
+    return false;
+  }
+  outLen = total;
   lastFaultStage = "none";
   lastFaultDetail = "";
   return true;
 }
 
+
 void hapticSet(bool on) {
-  int level = (on == HAPTIC_ACTIVE_HIGH) ? HIGH : LOW;
-  digitalWrite(HAPTIC_X, level);
-  digitalWrite(HAPTIC_Y, level);
-  digitalWrite(HAPTIC_Z, level);
+#if ENABLE_HAPTIC
+  digitalWrite(HAPTIC_PIN, on ? HIGH : LOW);
+#else
+  (void)on;
+#endif
 }
 
-void hapticOff() {
-  hapticSet(false);
-}
+void hapticOff() { hapticSet(false); }
 
 bool keyWasFired(const char* key) {
   if (!key || key[0] == '\0') return true;
@@ -362,8 +336,7 @@ void runHapticPattern(const int* pattern, int patternCount, const char* label) {
   if (!pattern || patternCount <= 0) return;
   Serial.print("HAPTIC pattern for "); Serial.println(label ? label : "event");
   for (int i = 0; i < patternCount; i++) {
-    bool on = (i % 2) == 0;
-    hapticSet(on);
+    hapticSet((i % 2) == 0);
     unsigned long dur = (unsigned long)pattern[i];
     if (dur > 3000UL) dur = 3000UL;
     unsigned long start = millis();
@@ -395,7 +368,6 @@ void parseEventsFromMeta(JsonArray arr) {
     if (n >= MAX_EVENTS) break;
     const char* key = ev["key"] | "";
     const char* type = ev["type"] | "prompt";
-    if ((!type || type[0] == '\0') && !ev["state"].isNull()) type = ev["state"];
     if (!key || key[0] == '\0') continue;
     events[n].active = true;
     events[n].popUp = ev["pop_up"] | false;
@@ -418,7 +390,7 @@ void parseEventsFromMeta(JsonArray arr) {
 }
 
 void acknowledgeActiveAlarm() {
-  if (currentPage == alarmPageIndex && activeAlarmKey.length() > 0) {
+  if (currentPage == CD_ALARM_PAGE_INDEX && activeAlarmKey.length() > 0) {
     markKeyFired(activeAlarmKey.c_str());
     Serial.print("ALARM DISMISS "); Serial.println(activeAlarmKey);
   }
@@ -428,305 +400,265 @@ void acknowledgeActiveAlarm() {
 
 void processEvents(bool allowDraw) {
   if (!timeSynced) return;
-  time_t nowT; time(&nowT);
+  time_t nowT;
+  time(&nowT);
   for (int i = 0; i < eventCount; i++) {
-    PdEvent &ev = events[i];
+    CdEvent &ev = events[i];
     if (!ev.active || ev.epoch <= 0) continue;
     if (nowT < ev.epoch) continue;
     if (keyWasFired(ev.key)) continue;
-
     bool isAlert = strcmp(ev.type, "alert") == 0;
-    if (ev.popUp && isAlert && allowDraw && pages[alarmPageIndex].loaded) {
-      if (currentPage != alarmPageIndex && currentPage < normalPageCount) lastNormalPage = currentPage;
-      currentPage = alarmPageIndex;
+    if (ev.popUp && isAlert && allowDraw && pageLoaded[CD_ALARM_PAGE_INDEX]) {
+      if (currentPage != CD_ALARM_PAGE_INDEX && currentPage < CD_NORMAL_PAGE_COUNT) lastNormalPage = currentPage;
+      currentPage = CD_ALARM_PAGE_INDEX;
       activeAlarmKey = String(ev.key);
-      drawCurrentPageToDisplay(true);
+      drawCurrentPage();
     }
-
     runHapticPattern(ev.pattern, ev.patternCount, ev.key);
-    // Alerts are not self-repeating. Nag repetition is relay-side via a new key
-    // in the next overdue interval. Prompt/timekeeping buzzes are also one-shot.
     markKeyFired(ev.key);
     break;
   }
 }
 
-bool httpPOSTAck(uint32_t rev) {
-  if (!safeForNetwork()) return false;
-  String url = String(relayBaseUrl) + "/api/pd/ack?token=" + relayToken + "&bundle_revision=" + String(rev) + "&alert_revision=" + String(alertRevision) + "&page=" + pageKeys[currentPage];
+
+bool httpPOSTEmpty(const String& url) {
+  lastHttpUrl = url;
+  lastHttpCode = 0;
+  if (!safeForNetwork()) { setFault("net", "not_connected"); return false; }
   WiFiClientSecure client;
-  configureSecureClient(client);
+  configureSecure(client);
   HTTPClient http;
-  http.setTimeout(15000);
-  if (!http.begin(client, url)) return false;
+  http.setTimeout(httpTimeoutMs);
+  http.setReuse(false);
+  if (!http.begin(client, url)) { setFault("http", "post_begin_failed"); return false; }
   int code = http.POST("");
+  lastHttpCode = code;
   http.end();
-  if (code >= 200 && code < 300) {
-    lastAckedAlertRevision = alertRevision;
-    return true;
-  }
-  return false;
-}
-
-int pageIndexByKey(const char* key) {
-  for (int i = 0; i < pageCount; i++) {
-    if (strcmp(key, pageKeys[i]) == 0) return i;
-  }
-  return -1;
-}
-
-bool fetchOnePage(const char* key, uint32_t revision, bool force) {
-  int idx = pageIndexByKey(key);
-  if (idx < 0 || !pages[idx].payload) return false;
-  if (!force && pages[idx].loaded && pages[idx].revision == revision) return true;
-
-  uint8_t* tmp = (uint8_t*)heap_caps_malloc(PGB_TOTAL_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!tmp) tmp = (uint8_t*)malloc(PGB_TOTAL_BYTES);
-  if (!tmp) {
-    setFault("memory", "tmp_pgb_alloc");
+  if (code < 200 || code >= 300) {
+    setFault("http", String("POST_") + String(code));
     return false;
   }
-
-  String url = String(relayBaseUrl) + "/api/pd/page?token=" + relayToken + "&page=" + key;
-  size_t got = 0;
-  bool ok = httpGETBinaryToBuffer(url, tmp, PGB_TOTAL_BYTES, got);
-  if (!ok) {
-    free(tmp);
-    return false;
-  }
-  if (got != PGB_TOTAL_BYTES || tmp[0] != 'P' || tmp[1] != 'G' || tmp[2] != 'B' || tmp[3] != '1') {
-    free(tmp);
-    setFault("pgb", "bad_header");
-    return false;
-  }
-  uint16_t w = tmp[4] | (tmp[5] << 8);
-  uint16_t h = tmp[6] | (tmp[7] << 8);
-  uint8_t bpp = tmp[8];
-  if (w != PD_W || h != PD_H || bpp != 2) {
-    free(tmp);
-    setFault("pgb", "bad_geometry");
-    return false;
-  }
-  memcpy(pages[idx].payload, tmp + PGB_HEADER_BYTES, PGB_DATA_BYTES);
-  free(tmp);
-  pages[idx].revision = revision;
-  pages[idx].loaded = true;
-  lastPageOkMs = millis();
-  Serial.print("Page loaded: "); Serial.print(key); Serial.print(" rev="); Serial.println(revision);
   return true;
 }
 
-bool fetchMetaAndChangedPages(bool force) {
-  String payload;
-  String url = String(relayBaseUrl) + "/api/pd/meta?token=" + relayToken;
-  if (!httpGETText(url, payload)) return false;
+void unpackContiguousBitsToRowPadded(const uint8_t* src, uint8_t* dst) {
+  memset(dst, 0, CD_PAGE_BYTES);
+  for (int y = 0; y < CD_H; y++) {
+    for (int x = 0; x < CD_W; x++) {
+      size_t srcBit = (size_t)y * (size_t)CD_W + (size_t)x;
+      uint8_t srcMask = 0x80 >> (srcBit % 8);
+      if (src[srcBit / 8] & srcMask) {
+        size_t dstIndex = (size_t)y * CD_ROW_BYTES + (size_t)(x / 8);
+        dst[dstIndex] |= (0x80 >> (x % 8));
+      }
+    }
+  }
+}
+
+bool fetchCdPage(int idx, const String& url, uint32_t revision) {
+  if (idx < 0 || idx >= CD_PAGE_COUNT) return false;
+  const size_t MAX_PAYLOAD = 10 + CD_PAGE_BYTES;
+  const size_t ROW_PADDED_PAYLOAD = 10 + CD_PAGE_BYTES;
+  const size_t CONTIG_PAYLOAD = 10 + CD_CONTIG_PAGE_BYTES;
+  uint8_t tmp[MAX_PAYLOAD];
+  size_t got = 0;
+  if (!httpGETBinary(url, tmp, MAX_PAYLOAD, got)) return false;
+  if (got != ROW_PADDED_PAYLOAD && got != CONTIG_PAYLOAD) {
+    setFault("page", String("bad_length_") + String(got));
+    return false;
+  }
+  if (tmp[0] != 'C' || tmp[1] != 'D' || tmp[2] != 'B' || tmp[3] != '1') {
+    setFault("page", "bad_magic"); return false;
+  }
+  int w = tmp[4] | (tmp[5] << 8);
+  int h = tmp[6] | (tmp[7] << 8);
+  int bpp = tmp[8];
+  if (w != CD_W || h != CD_H || bpp != 1) {
+    setFault("page", "bad_header"); return false;
+  }
+
+  if (got == ROW_PADDED_PAYLOAD) {
+    memcpy(pageCache[idx], tmp + 10, CD_PAGE_BYTES);
+    Serial.print("Loaded row-padded page ");
+  } else {
+    unpackContiguousBitsToRowPadded(tmp + 10, pageCache[idx]);
+    Serial.print("Loaded legacy contiguous page ");
+  }
+  Serial.print(CD_PAGE_KEYS[idx]); Serial.print(" rev "); Serial.println(revision);
+  pageLoaded[idx] = true;
+  pageRevision[idx] = revision;
+  return true;
+}
+
+bool fetchCdMetaAndPages(bool forceAll) {
+  String metaPayload;
+  String url = String(relayBaseUrl) + "/api/cd/meta?token=" + relayToken;
+  if (!httpGETString(url, metaPayload)) return false;
+
   DynamicJsonDocument doc(8192);
-  DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    setFault("json", String("meta_") + err.c_str());
-    return false;
-  }
-  if (!(doc["ok"] | false)) {
-    setFault("json", "meta_not_ok");
-    return false;
-  }
+  DeserializationError err = deserializeJson(doc, metaPayload);
+  if (err) { setFault("json", String("meta_") + err.c_str()); return false; }
+  if (!(doc["ok"] | false)) { setFault("json", "meta_not_ok"); return false; }
+
   bundleRevision = doc["bundle_revision"] | 0;
   alertRevision = doc["alert_revision"] | 0;
+  alertState = doc["alert"]["state"] | "none";
   parseEventsFromMeta(doc["events"].as<JsonArray>());
-  JsonArray arr = doc["pages"].as<JsonArray>();
-  bool allOk = true;
-  for (JsonObject p : arr) {
-    const char* key = p["key"] | "";
+
+  JsonArray pages = doc["pages"].as<JsonArray>();
+  bool anyLoaded = false;
+  for (JsonObject p : pages) {
+    String key = p["page"] | "";
+    String pageUrl = p["url"] | "";
     uint32_t rev = p["revision"] | 0;
-    if (!fetchOnePage(key, rev, force)) allOk = false;
+    int idx = -1;
+    for (int i = 0; i < CD_PAGE_COUNT; i++) {
+      if (key == CD_PAGE_KEYS[i]) { idx = i; break; }
+    }
+    if (idx < 0 || pageUrl.length() == 0) continue;
+    if (forceAll || !pageLoaded[idx] || pageRevision[idx] != rev) {
+      if (fetchCdPage(idx, pageUrl, rev)) anyLoaded = true;
+    }
   }
-  lastMetaOkMs = millis();
-  if (allOk && (bundleRevision != lastAckedBundleRevision || alertRevision != lastAckedAlertRevision)) {
-    if (httpPOSTAck(bundleRevision)) lastAckedBundleRevision = bundleRevision;
+  lastSuccessfulSyncMs = millis();
+  String ackUrl = String(relayBaseUrl) + "/api/cd/ack?token=" + relayToken + "&bundle_revision=" + String(bundleRevision) + "&alert_revision=" + String(alertRevision) + "&page=" + CD_PAGE_KEYS[currentPage];
+  if (httpPOSTEmpty(ackUrl)) {
+    lastAckedBundleRevision = bundleRevision;
+    lastAckedAlertRevision = alertRevision;
   }
   processEvents(true);
-  return allOk;
+  return true;
 }
 
-uint8_t pgbLevelAt(const uint8_t* body, int x, int y) {
-  uint32_t i = (uint32_t)y * PD_W + x;
-  uint8_t packed = body[i / 4];
-  uint8_t shift = (3 - (i % 4)) * 2;
-  return (packed >> shift) & 0x03;
+void drawPageBitmap(const uint8_t* bits) {
+  // bits are row-padded: CD_ROW_BYTES per row. This is the format expected by Adafruit_GFX drawBitmap().
+  display.drawBitmap(0, 0, bits, CD_W, CD_H, GxEPD_BLACK);
 }
 
-bool levelToBlack(uint8_t level, int x, int y) {
-  if (level == 0) return true;
-  if (level == 3) return false;
-  // Ordered 2x2 dither matrix. level 1 = dark grey, level 2 = light grey.
-  static const uint8_t threshold2x2[2][2] = {{0, 2}, {3, 1}};
-  uint8_t threshold = threshold2x2[y & 1][x & 1];
-  uint8_t blackCount = (level == 1) ? 3 : 1;
-  return threshold < blackCount;
-}
-
-void drawCurrentPageToDisplay(bool fullRefresh) {
-  if (currentPage < 0 || currentPage >= pageCount) currentPage = 0;
-  if (!pages[currentPage].loaded || !pages[currentPage].payload) {
-    showStatusScreen("PD page missing", pageTitles[currentPage]);
-    return;
-  }
-  displayBusy = true;
-  Serial.print("Render page: "); Serial.println(pageKeys[currentPage]);
-  display.init(115200, true, 2, false);
-  display.setRotation(DISPLAY_ROTATION);
-  if (fullRefresh) display.setFullWindow();
-  else display.setPartialWindow(0, 0, PD_W, PD_H);
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-    const uint8_t* body = pages[currentPage].payload;
-    for (int y = 0; y < PD_H; y++) {
-      for (int x = 0; x < PD_W; x++) {
-        uint8_t level = pgbLevelAt(body, x, y);
-        if (levelToBlack(level, x, y)) {
-          display.drawPixel(x, y, GxEPD_BLACK);
-        }
-      }
-      if ((y % 10) == 0) delay(1);
-    }
-  } while (display.nextPage());
-  display.hibernate();
-  displayBusy = false;
-  lastRenderMs = millis();
-}
-
-void showStatusScreen(const String& line1, const String& line2) {
-  displayBusy = true;
-  display.init(115200, true, 2, false);
-  display.setRotation(DISPLAY_ROTATION);
+void drawCurrentPage() {
+  if (!pageLoaded[currentPage]) return;
+  Serial.print("Drawing page "); Serial.println(CD_PAGE_KEYS[currentPage]);
+  display.setRotation(CD_ROTATION);
   display.setFullWindow();
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
-    display.setTextColor(GxEPD_BLACK);
-    display.setTextSize(2);
-    display.setCursor(12, 40);
-    display.print("Pocket Device");
-    display.setTextSize(1);
-    display.setCursor(12, 84);
-    display.print(line1);
-    display.setCursor(12, 104);
-    display.print(line2);
-    display.setCursor(12, 132);
-    display.print("IP: "); display.print(activeAddress);
-    display.setCursor(12, 152);
-    display.print("Fault: "); display.print(lastFaultStage);
-    display.print(" / "); display.print(lastFaultDetail);
+    drawPageBitmap(pageCache[currentPage]);
   } while (display.nextPage());
-  display.hibernate();
-  displayBusy = false;
+  lastRenderMs = millis();
 }
-
-String localWebPage() {
-  String html = "<html><body><meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<h2>" BUILD_VERSION "</h2>";
-  html += "<p>Network: " + activeNetworkName + "<br>Address: " + activeAddress;
-  html += "<br>Current page: " + String(pageKeys[currentPage]);
-  html += "<br>Bundle revision: " + String(bundleRevision);
-  html += "<br>Fault: " + lastFaultStage + " / " + lastFaultDetail;
-  html += "<br>HTTP code: " + String(lastHttpCode);
-  html += "<br>Last URL: " + lastHttpUrl;
-  html += "<br>Free heap: " + String(ESP.getFreeHeap());
-  html += "<br>Free PSRAM: " + String(ESP.getFreePsram());
-  html += "<br>Alert revision: " + String(alertRevision);
-  html += " / acked=" + String(lastAckedAlertRevision);
-  html += "<br>Events cached: " + String(eventCount);
-  html += "<br>Active alarm key: " + activeAlarmKey + "</p>";
-  html += "<ul>";
-  for (int i = 0; i < pageCount; i++) {
-    html += "<li>" + String(pageKeys[i]) + ": " + String(pages[i].loaded ? "loaded" : "missing") + " rev=" + String(pages[i].revision) + "</li>";
-  }
-  html += "</ul>";
-  html += "<p><a href='/next'>Next page</a> · <a href='/refresh'>Refresh from relay</a></p>";
-  html += "</body></html>";
-  return html;
-}
-
-void handleRoot() { server.send(200, "text/html", localWebPage()); }
-void handleNext() {
-  if (currentPage == alarmPageIndex) acknowledgeActiveAlarm();
-  currentPage = (currentPage + 1) % normalPageCount;
-  lastNormalPage = currentPage;
-  drawCurrentPageToDisplay(false);
-  server.sendHeader("Location", "/"); server.send(303);
-}
-void handleRefresh() { fetchMetaAndChangedPages(true); drawCurrentPageToDisplay(true); server.sendHeader("Location", "/"); server.send(303); }
 
 void handleButton() {
   static bool wasDown = false;
   static unsigned long downAt = 0;
-  static bool longHandled = false;
-  bool down = digitalRead(BTN_PAGE) == LOW;
-  unsigned long now = millis();
-
+  bool down = digitalRead(CD_BUTTON_PIN) == LOW;
   if (down && !wasDown) {
-    downAt = now;
-    longHandled = false;
     wasDown = true;
-  }
-  if (down && wasDown && !longHandled && (now - downAt > 1200UL)) {
-    longHandled = true;
-    if (now - lastButtonChangeMs > 1000UL) {
-      lastButtonChangeMs = now;
-      fetchMetaAndChangedPages(true);
-      drawCurrentPageToDisplay(true);
-    }
-  }
-  if (!down && wasDown) {
-    unsigned long held = now - downAt;
+    downAt = millis();
+  } else if (!down && wasDown) {
+    unsigned long held = millis() - downAt;
     wasDown = false;
-    if (!longHandled && held > 30UL && held < 1000UL) {
-      if (now - lastButtonChangeMs > 250UL) {
-        lastButtonChangeMs = now;
-        if (currentPage == alarmPageIndex) acknowledgeActiveAlarm();
-        currentPage = (currentPage + 1) % normalPageCount;
-        lastNormalPage = currentPage;
-        if (currentPage == 0 && WiFi.status() != WL_CONNECTED && !displayBusy) {
-          connectPreferredOrFallback();
-        }
-        drawCurrentPageToDisplay(false);
+    if (held > 850) {
+      Serial.println("Button: long press refresh");
+      if (safeForNetwork()) {
+        fetchCdMetaAndPages(true);
+      } else {
+        connectPreferredOrFallback();
+        if (safeForNetwork()) { syncTimeNow(); fetchCdMetaAndPages(true); }
       }
+      drawCurrentPage();
+    } else if (held > 35) {
+      if (currentPage == CD_ALARM_PAGE_INDEX) {
+        Serial.println("Button: dismiss alarm");
+        acknowledgeActiveAlarm();
+        currentPage = lastNormalPage;
+      } else {
+        Serial.println("Button: short press next page");
+        currentPage = (currentPage + 1) % CD_NORMAL_PAGE_COUNT;
+      }
+      drawCurrentPage();
     }
   }
 }
+
+String localWebpage() {
+  String p = "<html><body><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  p += "<h2>"; p += BUILD_VERSION; p += "</h2>";
+  p += "<p>Mode: "; p += usingFallbackAP ? "Fallback AP" : "WiFi";
+  p += "<br>Network: "; p += activeNetworkName;
+  p += "<br>Address: "; p += activeAddress;
+  p += "<br>Page: "; p += CD_PAGE_KEYS[currentPage];
+  p += "<br>Bundle rev: "; p += String(bundleRevision);
+  p += "<br>Alert rev: "; p += String(alertRevision);
+  p += "<br>Events: "; p += String(eventCount);
+  p += "<br>Alert state: "; p += alertState;
+  p += "<br>Time synced: "; p += timeSynced ? "yes" : "no";
+  p += "</p><h3>Diagnostics</h3><p>Fault: "; p += lastFaultStage; p += " / "; p += lastFaultDetail;
+  p += "<br>HTTP code: "; p += String(lastHttpCode);
+  p += "<br>Last URL: "; p += lastHttpUrl;
+  p += "<br>Free heap: "; p += String(ESP.getFreeHeap());
+  p += "<br>Chip model: "; p += String(ESP.getChipModel());
+  p += "</p>";
+  p += "<p>Loaded: ";
+  for (int i = 0; i < CD_PAGE_COUNT; i++) { p += CD_PAGE_KEYS[i]; p += pageLoaded[i] ? " ok " : " no "; }
+  p += "</p>";
+  p += "<form action='/next'><input type='submit' value='Next page'></form>";
+  p += "<form action='/refresh'><input type='submit' value='Refresh from relay'></form>";
+  p += "</body></html>";
+  return p;
+}
+
+void handleRoot() { server.send(200, "text/html", localWebpage()); }
+void handleNext() { if (currentPage == CD_ALARM_PAGE_INDEX) acknowledgeActiveAlarm(); currentPage = (currentPage + 1) % CD_NORMAL_PAGE_COUNT; drawCurrentPage(); server.sendHeader("Location", "/"); server.send(303); }
+void handleRefresh() { if (safeForNetwork()) fetchCdMetaAndPages(true); drawCurrentPage(); server.sendHeader("Location", "/"); server.send(303); }
 
 void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println();
   Serial.println("BOOT " BUILD_VERSION);
-  Serial.print("PSRAM: "); Serial.println(psramFound() ? "YES" : "NO");
-  allocatePageBuffers();
 
-  pinMode(BTN_PAGE, INPUT_PULLUP);
-  pinMode(HAPTIC_X, OUTPUT);
-  pinMode(HAPTIC_Y, OUTPUT);
-  pinMode(HAPTIC_Z, OUTPUT);
-  hapticOff();
-  clearEvents();
+  pinMode(CD_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(HAPTIC_PIN, OUTPUT);
+  digitalWrite(HAPTIC_PIN, LOW);
+
   SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
 
   connectPreferredOrFallback();
-  if (!usingFallbackAP) syncTimeNow();
-
   server.on("/", handleRoot);
   server.on("/next", handleNext);
   server.on("/refresh", handleRefresh);
   server.begin();
+  Serial.println("Local web server started");
 
-  bool ok = false;
-  if (safeForNetwork()) ok = fetchMetaAndChangedPages(true);
-  if (ok && pages[currentPage].loaded) {
-    drawCurrentPageToDisplay(true);
-  } else {
-    showStatusScreen("Relay fetch failed", activeNetworkName + " " + activeAddress);
+  display.init(115200, true, 2, false);
+  display.setRotation(CD_ROTATION);
+
+  if (safeForNetwork()) {
+    syncTimeNow();
+    fetchCdMetaAndPages(true);
   }
+
+  bool any = false;
+  for (int i = 0; i < CD_PAGE_COUNT; i++) any = any || pageLoaded[i];
+  if (any) {
+    currentPage = 0;
+    drawCurrentPage();
+  } else {
+    // Simple local fallback screen if relay unavailable.
+    display.setRotation(CD_ROTATION);
+    display.setFullWindow();
+    display.firstPage();
+    do {
+      display.fillScreen(GxEPD_WHITE);
+      display.setTextColor(GxEPD_BLACK);
+      display.setCursor(4, 18);
+      display.print("CD relay unavailable");
+      display.setCursor(4, 36);
+      display.print(activeAddress);
+    } while (display.nextPage());
+  }
+
   lastPollMs = millis();
 }
 
@@ -735,26 +667,17 @@ void loop() {
   handleButton();
   processEvents(true);
 
-  if (!usingFallbackAP && WiFi.status() == WL_CONNECTED && !displayBusy && (millis() - lastTimeSyncMs > timeSyncIntervalMs)) {
-    syncTimeNow();
-  }
-
-  if (!usingFallbackAP && WiFi.status() != WL_CONNECTED && !displayBusy) {
-    static unsigned long lastReconnect = 0;
-    if (millis() - lastReconnect > 60000UL) {
-      lastReconnect = millis();
-      connectPreferredOrFallback();
+  if (safeForNetwork() && millis() - lastPollMs > metaPollIntervalMs) {
+    if (fetchCdMetaAndPages(false)) {
+      // Only redraw automatically if the currently visible page changed.
+      if (pageLoaded[currentPage]) drawCurrentPage();
     }
-  }
-
-  if (!displayBusy && safeForNetwork() && (millis() - lastPollMs > pollIntervalMs)) {
     lastPollMs = millis();
-    bool beforeLoaded = pages[currentPage].loaded;
-    uint32_t beforeRev = pages[currentPage].revision;
-    fetchMetaAndChangedPages(false);
-    if (beforeLoaded && pages[currentPage].loaded && pages[currentPage].revision != beforeRev) {
-      drawCurrentPageToDisplay(false);
-    }
   }
-  delay(1);
+
+  if (!safeForNetwork() && !usingFallbackAP && WiFi.status() != WL_CONNECTED) {
+    connectPreferredOrFallback();
+  }
+
+  delay(5);
 }
